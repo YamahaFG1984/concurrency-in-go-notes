@@ -1,0 +1,2525 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 4 章 · Go 并发模式 — Go 并发编程图解笔记</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="4">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 4 章</span>
+<h1>Go 并发模式</h1>
+<p class="lede">
+  上一章认识了积木，这一章学怎样把积木搭成房子。这些模式是 Go 社区多年实践总结出来的：
+  怎样保证 goroutine 不泄漏、怎样把错误送回去、怎样用通道搭建可取消的数据管道、怎样扇出扇入、
+  以及标准库 <code>context</code> 包是怎样把这些思想固化下来的。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>用「约束」写出天然并发安全的代码，少用锁</li>
+    <li>记住一条铁律：谁启动 goroutine，谁负责让它能停下来</li>
+    <li>掌握 done 通道、or-channel、or-done、tee、bridge 这些可复用的通道「零件」</li>
+    <li>会搭建可取消的管道，并用扇出扇入加速慢的阶段</li>
+    <li>知道队列什么时候有用、什么时候是坑，会用利特尔法则估算</li>
+    <li>熟练使用 <code>context</code> 做取消、超时和传递请求级数据</li>
+  </ul>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 关于书中大量使用的 <code>interface{}</code></div>
+  <p>
+    这一章很多例子的通道类型是 <code>chan interface{}</code>。作者解释了两个原因：例子更简洁；而且某些模式（比如管道的通用阶段）本来就不关心类型。
+    在 2017 年，想要类型安全只能用代码生成器。<span class="ver">Go 1.18+</span> 有了<strong>泛型</strong>，可以写出既通用又类型安全的阶段，
+    本章「管道」一节末尾给出了一套用泛型和 <code>context</code> 重写的工具函数。
+  </p>
+</div>
+
+<div id="chapter-toc"></div>
+
+<!-- ============================================================ -->
+<h2 id="confinement">约束（Confinement）</h2>
+
+<p>写并发代码时，保证安全的方式有好几种。前面讲了两种：</p>
+<ul>
+  <li>用于共享内存的同步原语（如 <code>sync.Mutex</code>）；</li>
+  <li>通过通信来同步（如通道）。</li>
+</ul>
+<p>还有两种方式在多个并发进程中<strong>天然是安全的</strong>：</p>
+<ul>
+  <li><strong>不可变数据</strong>：每个并发进程都可以读，但不能改；要修改就创建一份新的副本。这减轻了心智负担，临界区更小（甚至没有），程序可能更快。在 Go 里，可以通过使用值的副本而不是指针来做到。</li>
+  <li><strong>受约束保护的数据</strong>：保证信息<strong>只能从一个并发进程访问</strong>。做到这一点，程序就天然安全，根本不需要同步。</li>
+</ul>
+
+<p>约束有两种：<strong>特设约束（ad hoc）</strong>和<strong>词法约束（lexical）</strong>。</p>
+
+<p>
+  <strong>特设约束</strong>靠约定实现 —— 语言社区的约定、团队的约定或代码库的约定。作者认为，除非每次提交都跑静态分析，否则在任何规模的项目里都很难坚持。看个例子：
+</p>
+
+<div class="code" data-lang="go" data-file="confinement/fig-confinement-ad-hoc.go">
+<pre>
+data := make([]int, 4)
+
+loopData := func(handleData chan&lt;- int) {
+	defer close(handleData)
+	for i := range data {
+		handleData &lt;- data[i]
+	}
+}
+
+handleData := make(chan int)
+go loopData(handleData)
+
+for num := range handleData {
+	fmt.Println(num)
+}
+</pre>
+</div>
+
+<p>
+  <code>data</code> 切片在 <code>loopData</code> 和主 goroutine 里都能访问到，只是<strong>按约定</strong>只在 <code>loopData</code> 里访问。
+  可是代码经手的人多了、截止日期逼近时，就可能有人犯错，约束随之瓦解。所以作者更喜欢<strong>词法约束：用编译器来强制约束</strong>。
+</p>
+
+<p>
+  词法约束利用<strong>词法作用域</strong>，只把正确的数据和并发原语暴露给需要它们的并发进程，<strong>让人根本没法做错</strong>。第 3 章「通道所有权」其实已经用过：
+</p>
+
+<div class="code" data-lang="go" data-file="confinement/fig-confinement-ownership.go">
+<pre>
+chanOwner := func() &lt;-chan int {
+	results := make(chan int, 5) // ① 在 chanOwner 的词法作用域内创建通道：写的能力被约束在下面的闭包里
+	go func() {
+		defer close(results)
+		for i := 0; i &lt;= 5; i++ {
+			results &lt;- i
+		}
+	}()
+	return results
+}
+
+consumer := func(results &lt;-chan int) { // ③ 只拿到只读副本，consumer 内部只能读
+	for result := range results {
+		fmt.Printf("Received: %d\n", result)
+	}
+	fmt.Println("Done receiving!")
+}
+
+results := chanOwner() // ② 主 goroutine 拿到的也只是只读视图
+consumer(results)
+</pre>
+</div>
+
+<p>通道本身就是并发安全的，所以这个例子不算太有趣。来看一个用<strong>非</strong>并发安全的数据结构 <code>bytes.Buffer</code> 的例子：</p>
+
+<div class="code" data-lang="go" data-file="confinement/fig-confinement-structs.go">
+<pre>
+printData := func(wg *sync.WaitGroup, data []byte) {
+	defer wg.Done()
+
+	var buff bytes.Buffer
+	for _, b := range data {
+		fmt.Fprintf(&amp;buff, "%c", b)
+	}
+	fmt.Println(buff.String())
+}
+
+var wg sync.WaitGroup
+wg.Add(2)
+data := []byte("golang")
+go printData(&amp;wg, data[:3]) // ① 只传前 3 个字节
+go printData(&amp;wg, data[3:]) // ② 只传后 3 个字节
+
+wg.Wait()
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="词法约束：把切片的不同部分分别交给不同 goroutine，彼此无法访问对方的数据">
+  <text class="lbl" x="380" y="22" text-anchor="middle">data := []byte("golang")</text>
+  <rect class="bx-b" x="200" y="34" width="60" height="40" rx="6"/><text class="mono on-b" x="230" y="59" text-anchor="middle">g</text>
+  <rect class="bx-b" x="262" y="34" width="60" height="40" rx="6"/><text class="mono on-b" x="292" y="59" text-anchor="middle">o</text>
+  <rect class="bx-b" x="324" y="34" width="60" height="40" rx="6"/><text class="mono on-b" x="354" y="59" text-anchor="middle">l</text>
+  <rect class="bx-p" x="386" y="34" width="60" height="40" rx="6"/><text class="mono on-p" x="416" y="59" text-anchor="middle">a</text>
+  <rect class="bx-p" x="448" y="34" width="60" height="40" rx="6"/><text class="mono on-p" x="478" y="59" text-anchor="middle">n</text>
+  <rect class="bx-p" x="510" y="34" width="60" height="40" rx="6"/><text class="mono on-p" x="540" y="59" text-anchor="middle">g</text>
+  <path class="ln-b" d="M292 78 L200 130" marker-end="url(#ar-b)"/><text class="mono on-b" x="230" y="104" text-anchor="end">data[:3]</text>
+  <path class="ln-p" d="M478 78 L570 130" marker-end="url(#ar-p)"/><text class="mono on-p" x="530" y="104">data[3:]</text>
+  <rect class="bx-b" x="80" y="134" width="220" height="56" rx="10"/>
+  <text class="ttl on-b" x="190" y="158" text-anchor="middle">goroutine 1</text><text class="sm" x="190" y="178" text-anchor="middle">只能看到 "gol"，打印 gol</text>
+  <rect class="bx-p" x="460" y="134" width="220" height="56" rx="10"/>
+  <text class="ttl on-p" x="570" y="158" text-anchor="middle">goroutine 2</text><text class="sm" x="570" y="178" text-anchor="middle">只能看到 "ang"，打印 ang</text>
+  <text class="sm" x="380" y="166" text-anchor="middle">printData 不闭包引用 data，</text>
+  <text class="sm" x="380" y="182" text-anchor="middle">只能处理传进来的那一段</text>
+</svg>
+<figcaption>图 4-1　词法约束：作用域决定了谁能碰哪块数据，不需要任何同步</figcaption>
+</figure>
+
+<p>
+  <code>printData</code> 没有闭包引用 <code>data</code>，只能处理传进来的那一段字节切片。我们传入不同的子集，借助词法作用域<strong>让做错事变得不可能</strong>
+  （除非用 <code>unsafe</code> 包手动操作内存 —— 它叫 unsafe 是有原因的），所以既不需要同步内存访问，也不需要通过通信共享数据。
+</p>
+
+<div class="box key">
+  <div class="t">&#9733; 为什么要追求约束？</div>
+  <p>
+    <strong>性能更好、心智负担更轻。</strong>同步有成本；避开同步就没有临界区，也就不用为它们付出代价，还一并避开了同步带来的那一类问题。
+    使用词法约束的并发代码通常也更容易理解，因为在你的词法作用域里，可以写同步（顺序）代码。当然，建立约束有时很难，这时就回到 Go 那些出色的并发原语。
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="for-select">for-select 循环</h2>
+
+<p>在 Go 程序里你会一次又一次地看到 for-select 循环，它不过是这样：</p>
+
+<div class="code" data-lang="go">
+<pre>
+for { // 无限循环，或者 range 某个东西
+	select {
+	// 用通道做一些事
+	}
+}
+</pre>
+</div>
+
+<p><strong>场景一：把可迭代的东西逐个发到通道上</strong></p>
+
+<div class="code" data-lang="go">
+<pre>
+for _, s := range []string{"a", "b", "c"} {
+	select {
+	case &lt;-done:
+		return
+	case stringStream &lt;- s:
+	}
+}
+</pre>
+</div>
+
+<p><strong>场景二：无限循环，直到被叫停</strong>。有两种写法，选哪种纯属风格偏好：</p>
+
+<div class="vs">
+  <div class="old"><div class="h">select 尽量短</div>
+<div class="code" data-lang="go"><pre>
+for {
+	select {
+	case &lt;-done:
+		return
+	default:
+	}
+
+	// 做不可抢占的工作
+}
+</pre></div></div>
+  <div class="old"><div class="h">把工作放进 default</div>
+<div class="code" data-lang="go"><pre>
+for {
+	select {
+	case &lt;-done:
+		return
+	default:
+		// 做不可抢占的工作
+	}
+}
+</pre></div></div>
+</div>
+
+<p>这个模式没什么更多可说的，但它无处不在，值得单独提一下。</p>
+
+<!-- ============================================================ -->
+<h2 id="leaks">防止 goroutine 泄漏</h2>
+
+<p>
+  goroutine 便宜、容易创建，这是 Go 高效的原因之一。但它们<strong>确实消耗资源，而且不会被运行时垃圾回收</strong>。不管内存占用多小，我们都不希望它们在进程里到处闲置。
+  怎样保证它们被清理掉？
+</p>
+
+<p>先想想 goroutine 为什么会终止。它有三条路：</p>
+<ol>
+  <li>完成了工作；</li>
+  <li>遇到不可恢复的错误，无法继续；</li>
+  <li><strong>被告知停止工作。</strong></li>
+</ol>
+
+<p>
+  前两条是免费的 —— 那就是你的算法。第三条「工作取消」才是最重要的，因为存在<strong>网络效应</strong>：
+  如果你启动了一个 goroutine，它多半和其他几个 goroutine 有组织地协作。子 goroutine 是否该继续，可能取决于许多其他 goroutine 的状态。
+  拥有完整上下文的父 goroutine（通常是主 goroutine）应该能够告诉子 goroutine 终止。先看一个简单的泄漏：
+</p>
+
+<div class="code" data-lang="go" data-tone="bad" data-file="✗ preventing-goroutine-leaks/fig-goroutine-leaks-example.go">
+<pre>
+doWork := func(strings &lt;-chan string) &lt;-chan interface{} {
+	completed := make(chan interface{})
+	go func() {
+		defer fmt.Println("doWork exited.")
+		defer close(completed)
+		for s := range strings {
+			// 做些有趣的事
+			fmt.Println(s)
+		}
+	}()
+	return completed
+}
+
+doWork(nil)
+// 也许这里还有更多工作
+fmt.Println("Done.")
+</pre>
+</div>
+
+<p>
+  主 goroutine 传了一个 nil 通道给 <code>doWork</code>，于是 <code>strings</code> 永远不会有值，<code>doWork</code> 里的 goroutine 会在整个进程生命周期内驻留在内存里
+  （如果主 goroutine 还要和它汇合，就直接死锁了）。这个例子进程很短，但在真实程序里，goroutine 可能在长期运行的程序开头就被启动；最坏情况下主 goroutine 一直在启动新的泄漏 goroutine，内存不断攀升。
+</p>
+
+<p>
+  解决办法是在父子 goroutine 之间建立一个信号，让父亲能通知孩子取消。按惯例，这个信号是一个名为 <code>done</code> 的只读通道：
+  父 goroutine 把它传给子 goroutine，想取消时就关闭它。
+</p>
+
+<div class="code" data-lang="go" data-file="preventing-goroutine-leaks/fig-goroutine-leaks-cancellation.go">
+<pre>
+doWork := func(
+	done &lt;-chan interface{},   // ① 按惯例，done 通道是第一个参数
+	strings &lt;-chan string,
+) &lt;-chan interface{} {
+	terminated := make(chan interface{})
+	go func() {
+		defer fmt.Println("doWork exited.")
+		defer close(terminated)
+		for {
+			select {
+			case s := &lt;-strings:
+				// 做些有趣的事
+				fmt.Println(s)
+			case &lt;-done: // ② 无处不在的 for-select：检查 done 是否被关闭
+				return
+			}
+		}
+	}()
+	return terminated
+}
+
+done := make(chan interface{})
+terminated := doWork(done, nil)
+
+go func() { // ③ 1 秒后取消 doWork 里的 goroutine
+	time.Sleep(1 * time.Second)
+	fmt.Println("Canceling doWork goroutine...")
+	close(done)
+}()
+
+&lt;-terminated // ④ 和 doWork 的 goroutine 汇合
+fmt.Println("Done.")
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+Canceling doWork goroutine...
+doWork exited.
+Done.
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="父 goroutine 关闭 done 通道，子 goroutine 在 select 中收到信号后退出">
+  <rect class="bx-a" x="20" y="60" width="180" height="90" rx="12"/>
+  <text class="ttl on-a" x="110" y="86" text-anchor="middle">父 goroutine</text>
+  <text class="sm" x="110" y="108" text-anchor="middle">拥有全局信息</text>
+  <text class="mono on-a" x="110" y="132" text-anchor="middle">close(done)</text>
+  <rect class="bx-c" x="270" y="84" width="140" height="40" rx="20"/>
+  <text class="mono on-c" x="340" y="109" text-anchor="middle">done</text>
+  <path class="ln-a" d="M202 104 H266" marker-end="url(#ar-a)"/>
+  <rect class="bx-b" x="480" y="30" width="260" height="160" rx="12"/>
+  <text class="ttl on-b" x="610" y="54" text-anchor="middle">子 goroutine</text>
+  <text class="mono" x="500" y="80">for {</text>
+  <text class="mono" x="516" y="100">select {</text>
+  <text class="mono" x="532" y="120">case s := &lt;-strings: ...</text>
+  <text class="mono on-g" x="532" y="140">case &lt;-done: return ✓</text>
+  <text class="mono" x="516" y="160">}</text>
+  <text class="mono" x="500" y="178">}</text>
+  <path class="ln-c" d="M412 104 C 460 104, 470 136, 526 136" marker-end="url(#ar-c)"/>
+  <text class="sm" x="380" y="208" text-anchor="middle">无论子 goroutine 卡在「等输入」还是别的地方，只要 select 里有 &lt;-done，它就能被叫停</text>
+</svg>
+<figcaption>图 4-2　done 通道：父亲关闭，孩子退出</figcaption>
+</figure>
+
+<p>
+  虽然 <code>strings</code> 传的是 nil，goroutine 依然成功退出了。而且这次我们确实把两个 goroutine 汇合了，却没有死锁 —— 因为汇合之前，我们另开了一个 goroutine 在 1 秒后取消 <code>doWork</code>。泄漏消除了！
+</p>
+
+<p>上面处理的是「阻塞在接收上」的 goroutine。反过来，<strong>阻塞在发送上</strong>的呢？</p>
+
+<div class="code" data-lang="go" data-tone="bad" data-file="✗ preventing-goroutine-leaks/fig-leak-from-blocked-channel-write.go">
+<pre>
+newRandStream := func() &lt;-chan int {
+	randStream := make(chan int)
+	go func() {
+		defer fmt.Println("newRandStream closure exited.") // ① 成功退出时打印
+		defer close(randStream)
+		for {
+			randStream &lt;- rand.Int()
+		}
+	}()
+	return randStream
+}
+
+randStream := newRandStream()
+fmt.Println("3 random ints:")
+for i := 1; i &lt;= 3; i++ {
+	fmt.Printf("%d: %d\n", i, &lt;-randStream)
+}
+</pre>
+</div>
+
+<p>
+  输出里没有 <code>newRandStream closure exited.</code>：第三次读完之后，goroutine 卡在了往一个没人读的通道发送第四个随机数上，我们没法告诉生产者可以停了。
+  解决方式和接收端一样，给生产者一个 done 通道：
+</p>
+
+<div class="code" data-lang="go" data-file="preventing-goroutine-leaks/fig-leak-from-blocked-channel-write-solved.go">
+<pre>
+newRandStream := func(done &lt;-chan interface{}) &lt;-chan int {
+	randStream := make(chan int)
+	go func() {
+		defer fmt.Println("newRandStream closure exited.")
+		defer close(randStream)
+		for {
+			select {
+			case randStream &lt;- rand.Int():
+			case &lt;-done:
+				return
+			}
+		}
+	}()
+	return randStream
+}
+
+done := make(chan interface{})
+randStream := newRandStream(done)
+fmt.Println("3 random ints:")
+for i := 1; i &lt;= 3; i++ {
+	fmt.Printf("%d: %d\n", i, &lt;-randStream)
+}
+close(done)
+
+// 模拟还在进行的工作
+time.Sleep(1 * time.Second)
+// 输出最后会出现：newRandStream closure exited.
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 180" role="img" aria-label="goroutine 泄漏的两种形态：阻塞在接收和阻塞在发送">
+  <rect class="bx-r" x="20" y="20" width="340" height="120" rx="12"/>
+  <text class="ttl on-r" x="190" y="46" text-anchor="middle">泄漏形态 ①：卡在接收</text>
+  <text class="mono" x="190" y="74" text-anchor="middle">for s := range strings { ... }</text>
+  <text class="sm" x="190" y="98" text-anchor="middle">上游永远不发、也永远不关闭</text>
+  <text class="sm on-g" x="190" y="122" text-anchor="middle">解法：select 里同时等 &lt;-done</text>
+  <rect class="bx-r" x="400" y="20" width="340" height="120" rx="12"/>
+  <text class="ttl on-r" x="570" y="46" text-anchor="middle">泄漏形态 ②：卡在发送</text>
+  <text class="mono" x="570" y="74" text-anchor="middle">randStream &lt;- rand.Int()</text>
+  <text class="sm" x="570" y="98" text-anchor="middle">下游不读了，生产者不知道</text>
+  <text class="sm on-g" x="570" y="122" text-anchor="middle">解法：发送也放进带 &lt;-done 的 select</text>
+  <text class="lbl" x="380" y="168" text-anchor="middle">凡是可能阻塞的通道操作，都要有一条「被取消」的退路</text>
+</svg>
+<figcaption>图 4-3　两种常见泄漏，同一种解法</figcaption>
+</figure>
+
+<div class="box key">
+  <div class="t">&#9733; 本书最重要的约定之一</div>
+  <p><strong>如果一个 goroutine 负责创建另一个 goroutine，它也要负责确保能让那个 goroutine 停下来。</strong></p>
+  <p>这条约定让程序在增长时依然可组合、可扩展。不同类型的 goroutine 停止的方式可能不同，但都建立在「传入 done 通道」这个基础上。后面的「管道」和 <code>context</code> 会反复用到它。</p>
+</div>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：怎样发现泄漏</div>
+  <ul>
+    <li><strong>测试里</strong>：Uber 的 <code>go.uber.org/goleak</code> 在测试结束时检查是否有遗留的 goroutine，一行 <code>defer goleak.VerifyNone(t)</code> 即可。</li>
+    <li><strong>测试里</strong> <span class="ver">Go 1.25+</span>：<code>testing/synctest</code> 的「气泡」结束时，如果还有 goroutine 阻塞着，测试会失败（第 5 章、附录 A）。</li>
+    <li><strong>线上</strong> <span class="ver">Go 1.26 实验 / 1.27</span>：<code>runtime/pprof</code> 的 <code>goroutineleak</code> profile 能找出阻塞在「已经不可达」的通道或锁上的 goroutine —— 本节两个泄漏的例子都能被它准确地揪出来。</li>
+    <li>今天新写的代码，取消信号通常用 <code>context.Context</code> 而不是自制的 done 通道，原理完全相同（本章最后一节）。</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="or-channel">or-channel</h2>
+
+<p>
+  有时你想把一个或多个 done 通道合并成一个：<strong>任何一个</strong>组成通道关闭，合并后的通道就关闭。直接写一个 <code>select</code> 当然可以，只是啰嗦；
+  但如果<strong>运行时才知道</strong>有几个 done 通道，就没法写死 <code>select</code> 了。这时可以用 or-channel 模式，它通过递归和 goroutine 构造一个组合的 done 通道：
+</p>
+
+<div class="code" data-lang="go" data-file="the-or-channel/fig-or-channel.go">
+<pre>
+var or func(channels ...&lt;-chan interface{}) &lt;-chan interface{}
+or = func(channels ...&lt;-chan interface{}) &lt;-chan interface{} { // ① 接收可变数量的通道，返回一个通道
+	switch len(channels) {
+	case 0: // ② 递归终止条件：没有通道，返回 nil 通道（永远不会关闭，符合直觉）
+		return nil
+	case 1: // ③ 递归终止条件：只有一个，直接返回它
+		return channels[0]
+	}
+
+	orDone := make(chan interface{})
+	go func() { // ④ 主体：开一个 goroutine，不阻塞地等待
+		defer close(orDone)
+
+		switch len(channels) {
+		case 2: // ⑤ 优化：每次递归至少有两个通道，两个时单独处理，少开 goroutine
+			select {
+			case &lt;-channels[0]:
+			case &lt;-channels[1]:
+			}
+		default: // ⑥ 等前三个，或者「其余通道 + orDone」递归组成的 or-channel
+			select {
+			case &lt;-channels[0]:
+			case &lt;-channels[1]:
+			case &lt;-channels[2]:
+			case &lt;-or(append(channels[3:], orDone)...):
+			}
+		}
+	}()
+	return orDone
+}
+</pre>
+</div>
+
+<p>
+  第 ⑥ 步把 <code>orDone</code> 也传进递归调用，这样当树上层的 goroutine 退出时，树下层的 goroutine 也会跟着退出。这棵递归树长这样：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="or 函数递归构造的 goroutine 树">
+  <rect class="bx-a" x="270" y="20" width="220" height="44" rx="10"/>
+  <text class="mono on-a" x="380" y="40" text-anchor="middle">or(c1, c2, c3, c4, c5, c6, c7)</text>
+  <text class="sm" x="380" y="56" text-anchor="middle">goroutine A：select c1 | c2 | c3 | 子树</text>
+  <rect class="bx" x="40" y="110" width="80" height="34" rx="8"/><text class="mono" x="80" y="132" text-anchor="middle">c1</text>
+  <rect class="bx" x="140" y="110" width="80" height="34" rx="8"/><text class="mono" x="180" y="132" text-anchor="middle">c2</text>
+  <rect class="bx" x="240" y="110" width="80" height="34" rx="8"/><text class="mono" x="280" y="132" text-anchor="middle">c3</text>
+  <rect class="bx-a" x="400" y="104" width="300" height="46" rx="10"/>
+  <text class="mono on-a" x="550" y="124" text-anchor="middle">or(c4, c5, c6, c7, orDone_A)</text>
+  <text class="sm" x="550" y="142" text-anchor="middle">goroutine B：select c4 | c5 | c6 | 子树</text>
+  <path class="ln" d="M330 66 L80 108 M350 66 L180 108 M370 66 L280 108"/>
+  <path class="ln-a" d="M420 66 L520 102"/>
+  <rect class="bx" x="360" y="196" width="70" height="34" rx="8"/><text class="mono" x="395" y="218" text-anchor="middle">c4</text>
+  <rect class="bx" x="440" y="196" width="70" height="34" rx="8"/><text class="mono" x="475" y="218" text-anchor="middle">c5</text>
+  <rect class="bx" x="520" y="196" width="70" height="34" rx="8"/><text class="mono" x="555" y="218" text-anchor="middle">c6</text>
+  <rect class="bx-a" x="600" y="190" width="150" height="46" rx="10"/>
+  <text class="mono on-a" x="675" y="210" text-anchor="middle">or(c7, orDone_A)</text>
+  <text class="sm" x="675" y="228" text-anchor="middle">goroutine C（2 个的特例）</text>
+  <path class="ln" d="M480 152 L395 194 M510 152 L475 194 M540 152 L555 194"/>
+  <path class="ln-a" d="M600 152 L660 188"/>
+  <text class="lbl" x="200" y="196" text-anchor="middle">任何一个叶子关闭 →</text>
+  <text class="lbl" x="200" y="216" text-anchor="middle">它所在节点的 orDone 关闭 →</text>
+  <text class="lbl" x="200" y="236" text-anchor="middle">一路向上传到根</text>
+  <text class="sm" x="380" y="262" text-anchor="middle">根关闭时，orDone_A 也被传进了子树，所以下层 goroutine 同样会退出，不会泄漏</text>
+</svg>
+<figcaption>图 4-4　or-channel 的递归结构：一棵由 goroutine 组成的「或」树</figcaption>
+</figure>
+
+<p>用法示例：几个在不同时间关闭的通道，合并后只要最快的那个关闭就关闭：</p>
+
+<div class="code" data-lang="go">
+<pre>
+sig := func(after time.Duration) &lt;-chan interface{} { // ① 创建一个在 after 时间后关闭的通道
+	c := make(chan interface{})
+	go func() {
+		defer close(c)
+		time.Sleep(after)
+	}()
+	return c
+}
+
+start := time.Now() // ② 记录开始阻塞的时间
+&lt;-or(
+	sig(2*time.Hour),
+	sig(5*time.Minute),
+	sig(1*time.Second),
+	sig(1*time.Hour),
+	sig(1*time.Minute),
+)
+fmt.Printf("done after %v", time.Since(start)) // ③ done after 1.000216772s
+</pre>
+</div>
+
+<p>
+  这种简洁是用额外的 goroutine 换来的（约 ⌊x/2⌋ 个，x 为通道数）。但别忘了 Go 的强项就是快速创建、调度、运行 goroutine，担心这里的 goroutine 数量多半是过早优化。
+  而且如果编译时不知道有几个 done 通道，也没有别的办法合并它们。这个模式适合用在<strong>模块的交界处</strong>：那里往往有多个取消调用树的条件，用 <code>or</code> 合并后往下传即可。
+  本章后面的 <code>context</code> 是另一种（也许更好的）方式；第 5 章「复制请求」和「自愈」会用到 or 的变体。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：用 context 组合多个取消源 <span class="ver">Go 1.21+</span></div>
+  <p>
+    如果取消信号都是 <code>context</code>，可以用 <code>context.AfterFunc</code> 把另一个 context 的取消「接」到当前 context 上，效果就是「任一取消即取消」：
+  </p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="新写法：ctx1 或 ctx2 任一取消，ctx 就取消">
+<pre>
+ctx, cancel := context.WithCancelCause(ctx1)
+defer cancel(nil)
+stop := context.AfterFunc(ctx2, func() { cancel(context.Cause(ctx2)) })
+defer stop()
+</pre>
+  </div>
+  <p>运行时才知道通道数量、又不想递归时，还可以用 <code>reflect.Select</code>，不过它更慢、可读性也差，一般不推荐。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="errors">错误处理</h2>
+
+<p>
+  并发程序里，错误处理很容易被忽略：我们花太多精力考虑进程间如何共享信息和协调，忘了考虑它们如何优雅地处理出错状态。
+  Go 放弃了流行的异常模型，这本身就是一种表态：错误处理很重要，错误路径应该得到和算法同等的关注。
+</p>
+
+<p>
+  最根本的问题是：<strong>谁负责处理这个错误？</strong>并发进程独立于父亲和兄弟运行，很难判断拿着错误该怎么办。看这段代码：
+</p>
+
+<div class="code" data-lang="go" data-tone="bad" data-file="✗ error-handling/fig-patterns-imporoper-err-handling.go">
+<pre>
+checkStatus := func(
+	done &lt;-chan interface{},
+	urls ...string,
+) &lt;-chan *http.Response {
+	responses := make(chan *http.Response)
+	go func() {
+		defer close(responses)
+		for _, url := range urls {
+			resp, err := http.Get(url)
+			if err != nil {
+				fmt.Println(err) // ① 只能尽力打印。它还能怎么办？没法把错误传回去！
+				continue         //    多少个错误算太多？还要继续请求吗？
+			}
+			select {
+			case &lt;-done:
+				return
+			case responses &lt;- resp:
+			}
+		}
+	}()
+	return responses
+}
+</pre>
+</div>
+
+<p>
+  goroutine 别无选择：它不能吞掉错误，只能打印出来、指望有人在看。<strong>别把 goroutine 置于这种尴尬的境地。</strong>作者的建议是关注点分离：
+  并发进程应该把错误发送到程序中<strong>拥有完整状态信息</strong>的另一部分，由它来做更明智的决定：
+</p>
+
+<div class="code" data-lang="go" data-file="error-handling/fig-patterns-proper-err-handling.go">
+<pre>
+type Result struct { // ① 把 *http.Response 和可能的 error 打包在一起
+	Error    error
+	Response *http.Response
+}
+checkStatus := func(done &lt;-chan interface{}, urls ...string) &lt;-chan Result { // ② 返回结果通道
+	results := make(chan Result)
+	go func() {
+		defer close(results)
+		for _, url := range urls {
+			var result Result
+			resp, err := http.Get(url)
+			result = Result{Error: err, Response: resp} // ③ 无论成败都打包
+			select {
+			case &lt;-done:
+				return
+			case results &lt;- result: // ④ 把结果发出去
+			}
+		}
+	}()
+	return results
+}
+
+done := make(chan interface{})
+defer close(done)
+
+urls := []string{"https://www.google.com", "https://badhost"}
+for result := range checkStatus(done, urls...) {
+	if result.Error != nil { // ⑤ 在主 goroutine 里，带着全局上下文处理错误
+		fmt.Printf("error: %v", result.Error)
+		continue
+	}
+	fmt.Printf("Response: %v\n", result.Response.Status)
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="把结果和错误打包成 Result 发给拥有完整上下文的一方处理">
+  <rect class="bx-b" x="20" y="50" width="200" height="90" rx="12"/>
+  <text class="ttl on-b" x="120" y="76" text-anchor="middle">生产者 goroutine</text>
+  <text class="sm" x="120" y="98" text-anchor="middle">只管干活，不做决定</text>
+  <text class="sm" x="120" y="118" text-anchor="middle">成功、失败都如实上报</text>
+  <rect class="bx-g" x="280" y="40" width="96" height="30" rx="7"/><text class="sm on-g" x="328" y="60" text-anchor="middle">Result{resp}</text>
+  <rect class="bx-r" x="280" y="80" width="96" height="30" rx="7"/><text class="sm on-r" x="328" y="100" text-anchor="middle">Result{err}</text>
+  <rect class="bx-g" x="280" y="120" width="96" height="30" rx="7"/><text class="sm on-g" x="328" y="140" text-anchor="middle">Result{resp}</text>
+  <path class="ln-c flow" d="M222 95 H272"/>
+  <path class="ln-c flow" d="M384 95 H462" marker-end="url(#ar-c)"/>
+  <rect class="bx-a" x="466" y="40" width="274" height="110" rx="12"/>
+  <text class="ttl on-a" x="603" y="66" text-anchor="middle">主 goroutine（拥有全局上下文）</text>
+  <text class="sm" x="603" y="90" text-anchor="middle">记录日志？重试？</text>
+  <text class="sm" x="603" y="110" text-anchor="middle">错误超过 3 个就停下？</text>
+  <text class="sm" x="603" y="130" text-anchor="middle">取消其他子任务？</text>
+  <text class="lbl" x="380" y="186" text-anchor="middle">错误是一等公民：和结果走同一条通信线路，像同步函数的 (T, error) 一样</text>
+</svg>
+<figcaption>图 4-5　把「可能的结果」和「可能的错误」耦合在一起，让有上下文的一方来决定</figcaption>
+</figure>
+
+<p>
+  关键是：我们把可能的结果和可能的错误<strong>耦合在了一起</strong>，它代表 <code>checkStatus</code> 这个 goroutine 的完整结果集合。
+  于是可以写更复杂的规则，比如错误达到 3 个就停止检查：
+</p>
+
+<div class="code" data-lang="go" data-file="error-handling/fig-stop-after-three-errors.go（节选）">
+<pre>
+done := make(chan interface{})
+defer close(done) // break 之后，defer 会关闭 done，checkStatus 里的 goroutine 随之退出
+
+errCount := 0
+urls := []string{"a", "https://www.google.com", "b", "c", "d"}
+for result := range checkStatus(done, urls...) {
+	if result.Error != nil {
+		fmt.Printf("error: %v\n", result.Error)
+		errCount++
+		if errCount &gt;= 3 {
+			fmt.Println("Too many errors, breaking!")
+			break
+		}
+		continue
+	}
+	fmt.Printf("Response: %v\n", result.Response.Status)
+}
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+error: Get a: unsupported protocol scheme ""
+Response: 200 OK
+error: Get b: unsupported protocol scheme ""
+error: Get c: unsupported protocol scheme ""
+Too many errors, breaking!
+</pre>
+</div>
+
+<div class="box key">
+  <div class="t">&#9733; 错误是一等公民</div>
+  <p>构造 goroutine 的返回值时，如果 goroutine 可能产生错误，就让错误和结果类型<strong>紧密耦合</strong>，通过同一条通信线路传回去 —— 就像普通同步函数返回 <code>(T, error)</code> 一样。</p>
+</div>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：errgroup、泛型 Result 与 errors.Join</div>
+  <ul>
+    <li><code>golang.org/x/sync/errgroup</code>：「启动一组 goroutine，返回第一个错误，并通过 context 取消其余的」，是这个模式最常用的现成实现（第 5 章有示例）。</li>
+    <li><span class="ver">Go 1.18+</span> 可以写一个通用的 <code>type Result[T any] struct { Val T; Err error }</code>，所有阶段复用。</li>
+    <li><span class="ver">Go 1.20+</span> 想把多个错误一起报告，用 <code>errors.Join(errs...)</code>，调用方仍可用 <code>errors.Is/As</code> 逐个检查。</li>
+    <li>示例里用到 <code>resp</code> 后别忘了 <code>resp.Body.Close()</code>，否则会泄漏连接（书中为简洁省略了）。</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="pipelines">管道（Pipeline）</h2>
+
+<p>
+  写程序时，我们不会写一个超长的函数，而是构建函数、结构体、方法等抽象：一是为了把与主流程无关的细节藏起来，二是为了改一处时不影响别处。
+  <strong>管道</strong>是另一种构建抽象的工具，特别适合程序需要处理<strong>数据流或批量数据</strong>的时候。
+</p>
+
+<p>
+  管道不过是一系列「接收数据、对数据做操作、再把数据传出去」的东西，每个操作叫做管道的一个<strong>阶段（stage）</strong>。
+  用管道可以分离每个阶段的关注点：可以独立修改各个阶段、自由组合阶段、让各阶段与上下游并发执行、对某些部分扇出或限流。先从最简单的开始：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+multiply := func(values []int, multiplier int) []int {
+	multipliedValues := make([]int, len(values))
+	for i, v := range values {
+		multipliedValues[i] = v * multiplier
+	}
+	return multipliedValues
+}
+
+add := func(values []int, additive int) []int {
+	addedValues := make([]int, len(values))
+	for i, v := range values {
+		addedValues[i] = v + additive
+	}
+	return addedValues
+}
+
+ints := []int{1, 2, 3, 4}
+for _, v := range add(multiply(ints, 2), 1) {
+	fmt.Println(v) // 3 5 7 9
+}
+</pre>
+</div>
+
+<p>两个平平无奇的函数，为什么能称为「管道阶段」？因为它们具备阶段的两个属性：</p>
+<ul>
+  <li><strong>阶段消费和返回同一种类型</strong>（这里都是 <code>[]int</code>）；</li>
+  <li><strong>阶段必须被语言「具体化（reified）」</strong>，以便能被传来传去。Go 的函数是一等公民，可以赋给变量、作为参数，正好满足。</li>
+</ul>
+
+<p>熟悉函数式编程的读者可能想到了高阶函数和单子（monad）—— 管道阶段确实和它们密切相关。正因为具备这些属性，组合阶段非常容易，不用修改任何已有阶段：</p>
+
+<div class="code" data-lang="go">
+<pre>
+ints := []int{1, 2, 3, 4}
+for _, v := range multiply(add(multiply(ints, 2), 1), 2) {
+	fmt.Println(v) // 6 10 14 18
+}
+</pre>
+</div>
+
+<h3 id="batch-stream">批处理 vs 流处理</h3>
+
+<p>
+  上面每个阶段都接收一个切片、返回一个切片，这叫<strong>批处理</strong>：一次处理一整块数据。为了不修改原数据，每个阶段都要新建一个等长切片，
+  所以任一时刻程序的内存占用是输入的两倍。另一种是<strong>流处理</strong>：每次接收和产出一个元素：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+multiply := func(value, multiplier int) int {
+	return value * multiplier
+}
+add := func(value, additive int) int {
+	return value + additive
+}
+
+ints := []int{1, 2, 3, 4}
+for _, v := range ints {
+	fmt.Println(multiply(add(multiply(v, 2), 1), 2))
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="批处理每个阶段都要一整块内存，流处理一次只处理一个元素">
+  <text class="ttl on-y" x="185" y="24" text-anchor="middle">批处理：一次一整批</text>
+  <text class="ttl on-c" x="575" y="24" text-anchor="middle">流处理：一次一个</text>
+  <path class="ln-d" d="M380 12 V190"/>
+  <rect class="bx-y" x="20" y="50" width="100" height="30" rx="6"/><text class="mono on-y" x="70" y="70" text-anchor="middle">[1 2 3 4]</text>
+  <path class="ln" d="M122 65 H146" marker-end="url(#ar)"/>
+  <rect class="bx-y" x="150" y="50" width="100" height="30" rx="6"/><text class="mono on-y" x="200" y="70" text-anchor="middle">[2 4 6 8]</text>
+  <path class="ln" d="M252 65 H276" marker-end="url(#ar)"/>
+  <rect class="bx-y" x="280" y="50" width="92" height="30" rx="6"/><text class="mono on-y" x="326" y="70" text-anchor="middle">[3 5 7 9]</text>
+  <text class="sm" x="196" y="110" text-anchor="middle">每个阶段都分配一个和输入一样大的新切片</text>
+  <text class="sm" x="196" y="128" text-anchor="middle">内存峰值 ≈ 输入的 2 倍</text>
+
+  <circle class="dot-c" cx="420" cy="65" r="12"/><text class="sm" x="420" y="69" text-anchor="middle" style="fill:#fff">1</text>
+  <path class="ln-c" d="M434 65 H470" marker-end="url(#ar-c)"/>
+  <rect class="bx-c" x="474" y="50" width="56" height="30" rx="6"/><text class="mono on-c" x="502" y="70" text-anchor="middle">×2</text>
+  <path class="ln-c" d="M532 65 H550" marker-end="url(#ar-c)"/>
+  <rect class="bx-c" x="554" y="50" width="56" height="30" rx="6"/><text class="mono on-c" x="582" y="70" text-anchor="middle">+1</text>
+  <path class="ln-c" d="M612 65 H630" marker-end="url(#ar-c)"/>
+  <rect class="bx-c" x="634" y="50" width="56" height="30" rx="6"/><text class="mono on-c" x="662" y="70" text-anchor="middle">×2</text>
+  <path class="ln-c" d="M692 65 H716" marker-end="url(#ar-c)"/><text class="mono" x="732" y="70" text-anchor="middle">6</text>
+  <text class="sm" x="575" y="110" text-anchor="middle">内存只需容纳一个元素</text>
+  <text class="sm" x="575" y="128" text-anchor="middle">但上面的写法把管道塞进了 for 循环体，</text>
+  <text class="sm" x="575" y="146" text-anchor="middle">每轮都「重建」一次管道，也谈不上并发</text>
+  <text class="lbl" x="380" y="182" text-anchor="middle">→ 用通道把阶段连起来，就能兼得两者的好处</text>
+</svg>
+<figcaption>图 4-6　批处理与流处理</figcaption>
+</figure>
+
+<h3 id="pipeline-chan">用通道构建管道的最佳实践</h3>
+
+<p>
+  通道天生适合构建管道：它能接收和产出值、能安全地并发使用、能被 range、也被语言具体化了。把上面的例子改成用通道：
+</p>
+
+<div class="code" data-lang="go" data-file="pipelines/.../fig-pipelines-chan-stream-processing.go">
+<pre>
+generator := func(done &lt;-chan interface{}, integers ...int) &lt;-chan int {
+	intStream := make(chan int)
+	go func() {
+		defer close(intStream)
+		for _, i := range integers {
+			select {
+			case &lt;-done:
+				return
+			case intStream &lt;- i:
+			}
+		}
+	}()
+	return intStream
+}
+
+multiply := func(
+	done &lt;-chan interface{},
+	intStream &lt;-chan int,
+	multiplier int,
+) &lt;-chan int {
+	multipliedStream := make(chan int)
+	go func() {
+		defer close(multipliedStream)
+		for i := range intStream {
+			select {
+			case &lt;-done:
+				return
+			case multipliedStream &lt;- i * multiplier:
+			}
+		}
+	}()
+	return multipliedStream
+}
+
+add := func(
+	done &lt;-chan interface{},
+	intStream &lt;-chan int,
+	additive int,
+) &lt;-chan int {
+	addedStream := make(chan int)
+	go func() {
+		defer close(addedStream)
+		for i := range intStream {
+			select {
+			case &lt;-done:
+				return
+			case addedStream &lt;- i + additive:
+			}
+		}
+	}()
+	return addedStream
+}
+
+done := make(chan interface{})
+defer close(done)
+
+intStream := generator(done, 1, 2, 3, 4)
+pipeline := multiply(done, add(done, multiply(done, intStream, 2), 1), 2)
+
+for v := range pipeline {
+	fmt.Println(v) // 6 10 14 18
+}
+</pre>
+</div>
+
+<p>代码多了不少，换来了什么？拆开来看：</p>
+<ul>
+  <li><code>done</code> 通道 + <code>defer close(done)</code>：保证程序干净退出、不泄漏 goroutine。没有新东西。</li>
+  <li><code>generator</code>：把一组离散的值变成通道上的数据流。这种函数就叫<strong>生成器</strong>，管道开头总要有一批数据需要转换成通道。</li>
+  <li>每个阶段都：起一个 goroutine、接收 done、range 上游通道、在带 done 的 select 里发送、返回自己创建的通道。</li>
+</ul>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="用通道连接的四阶段管道，每个阶段都是一个 goroutine，共享同一个 done 通道">
+  <rect class="bx-g" x="14" y="60" width="130" height="60" rx="10"/>
+  <text class="ttl on-g" x="79" y="84" text-anchor="middle">generator</text><text class="sm" x="79" y="104" text-anchor="middle">1, 2, 3, 4</text>
+  <path class="ln-c flow" d="M146 90 H186" marker-end="url(#ar-c)"/>
+  <rect class="bx-b" x="190" y="60" width="120" height="60" rx="10"/>
+  <text class="ttl on-b" x="250" y="84" text-anchor="middle">multiply</text><text class="sm" x="250" y="104" text-anchor="middle">× 2</text>
+  <path class="ln-c flow" d="M312 90 H352" marker-end="url(#ar-c)"/>
+  <rect class="bx-b" x="356" y="60" width="120" height="60" rx="10"/>
+  <text class="ttl on-b" x="416" y="84" text-anchor="middle">add</text><text class="sm" x="416" y="104" text-anchor="middle">+ 1</text>
+  <path class="ln-c flow" d="M478 90 H518" marker-end="url(#ar-c)"/>
+  <rect class="bx-b" x="522" y="60" width="120" height="60" rx="10"/>
+  <text class="ttl on-b" x="582" y="84" text-anchor="middle">multiply</text><text class="sm" x="582" y="104" text-anchor="middle">× 2</text>
+  <path class="ln-c flow" d="M644 90 H684" marker-end="url(#ar-c)"/>
+  <rect class="bx-a" x="688" y="66" width="62" height="48" rx="10"/>
+  <text class="sm on-a" x="719" y="88" text-anchor="middle">range</text><text class="sm" x="719" y="104" text-anchor="middle">6 10 14 18</text>
+  <text class="sm" x="166" y="50" text-anchor="middle">chan</text><text class="sm" x="332" y="50" text-anchor="middle">chan</text><text class="sm" x="498" y="50" text-anchor="middle">chan</text><text class="sm" x="664" y="50" text-anchor="middle">chan</text>
+
+  <rect class="bx-r" x="230" y="170" width="300" height="40" rx="20"/>
+  <text class="mono on-r" x="380" y="195" text-anchor="middle">done（所有阶段共享）</text>
+  <path class="ln-r" style="stroke-dasharray:4 4" d="M79 122 V150 H680 M250 122 V150 M416 122 V150 M582 122 V150 M380 150 V166"/>
+  <text class="sm" x="380" y="226" text-anchor="middle">每个阶段一个 goroutine，各自只需等输入、能发出输出 —— 天然并发</text>
+</svg>
+<figcaption>图 4-7　通道版管道：阶段之间靠通道相连，靠 done 统一取消</figcaption>
+</figure>
+
+<p>这个管道和函数版本相比，有两个非常重要的不同：</p>
+<ol>
+  <li><strong>用了通道</strong>：管道末端可以用 range 取值；每个阶段的输入输出在并发环境下都是安全的。</li>
+  <li><strong>每个阶段并发执行</strong>：任何阶段只需要等它的输入、能发出它的输出。这在下一节「扇出扇入」里会有巨大的意义。</li>
+</ol>
+
+<p>下表展示了每个值进入每个阶段的时机（迭代次数从 0 开始计，格子里是进入该阶段的值）：</p>
+
+<div class="tw">
+<table>
+  <tr><th>迭代</th><th>Generator</th><th>Multiply</th><th>Add</th><th>Multiply</th><th>输出值</th></tr>
+  <tr><td>0</td><td>1</td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>0</td><td></td><td>1</td><td></td><td></td><td></td></tr>
+  <tr><td>0</td><td>2</td><td></td><td>2</td><td></td><td></td></tr>
+  <tr><td>0</td><td></td><td>2</td><td></td><td>3</td><td></td></tr>
+  <tr><td>0</td><td>3</td><td></td><td>4</td><td></td><td>6</td></tr>
+  <tr><td>1</td><td></td><td>3</td><td></td><td>5</td><td></td></tr>
+  <tr><td>1</td><td>4</td><td></td><td>6</td><td></td><td>10</td></tr>
+  <tr><td>2</td><td>(closed)</td><td>4</td><td></td><td>7</td><td></td></tr>
+  <tr><td>2</td><td></td><td>(closed)</td><td>8</td><td></td><td>14</td></tr>
+  <tr><td>3</td><td></td><td></td><td>(closed)</td><td>9</td><td></td></tr>
+  <tr><td>3</td><td></td><td></td><td></td><td>(closed)</td><td>18</td></tr>
+</table>
+</div>
+
+<h3 id="cascade">关闭 done 会发生什么？</h3>
+
+<p>阶段之间有两种连接：共同的 <code>done</code> 通道，以及传给下一阶段的通道。如果在管道还没跑完时就关闭 <code>done</code>：</p>
+
+<div class="tw">
+<table>
+  <tr><th>迭代</th><th>Generator</th><th>Multiply</th><th>Add</th><th>Multiply</th><th>输出值</th></tr>
+  <tr><td>0</td><td>1</td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>0</td><td></td><td>1</td><td></td><td></td><td></td></tr>
+  <tr><td>0</td><td>2</td><td></td><td>2</td><td></td><td></td></tr>
+  <tr><td>0</td><td></td><td>2</td><td></td><td>3</td><td></td></tr>
+  <tr><td>1</td><td>3</td><td></td><td>4</td><td></td><td>6</td></tr>
+  <tr><td><strong>close(done)</strong></td><td>(closed)</td><td>3</td><td></td><td>5</td><td></td></tr>
+  <tr><td></td><td></td><td>(closed)</td><td>6</td><td></td><td></td></tr>
+  <tr><td></td><td></td><td></td><td>(closed)</td><td>7</td><td></td></tr>
+  <tr><td></td><td></td><td></td><td></td><td>(closed)</td><td></td></tr>
+  <tr><td></td><td></td><td></td><td></td><td></td><td>(exit range)</td></tr>
+</table>
+</div>
+
+<p>看到关闭 <code>done</code> 是怎样<strong>级联</strong>穿过整个管道的了吗？这得益于每个阶段的两件事：</p>
+<ul>
+  <li><strong>range 上游通道</strong>：上游关闭时，range 自动退出；</li>
+  <li><strong>发送和 done 共用一个 select</strong>：无论阶段卡在等输入还是等发送，关闭 done 都能迫使它结束。</li>
+</ul>
+
+<div class="box deep">
+  <div class="t">&#128270; 用归纳法证明整条管道都可抢占</div>
+  <p>
+    管道开头必须把离散值转换成通道，这里有两处需要可抢占：①生成值本身（如果不是瞬间完成的）——这取决于你；②把值发送到通道 —— 由 select + done 保证。
+    管道末端，最后一个阶段 range 的通道在被抢占时会关闭，所以它也可抢占（因为它依赖的流可抢占）。
+    中间的每个阶段：卡在接收时，上游通道终会关闭（要么是同样写法的阶段，要么是已证明可抢占的开头）；卡在发送时，有 select 兜底。
+    于是<strong>关闭 done 总能让整条管道停下来</strong>。
+  </p>
+</div>
+
+<h3 id="generators">几个好用的生成器</h3>
+
+<p>回顾一下：管道的生成器就是把一组离散值转换成通道上数据流的函数。先看 <code>repeat</code>：</p>
+
+<div class="code" data-lang="go">
+<pre>
+repeat := func(
+	done &lt;-chan interface{},
+	values ...interface{},
+) &lt;-chan interface{} {
+	valueStream := make(chan interface{})
+	go func() {
+		defer close(valueStream)
+		for { // 无限重复，直到被叫停
+			for _, v := range values {
+				select {
+				case &lt;-done:
+					return
+				case valueStream &lt;- v:
+				}
+			}
+		}
+	}()
+	return valueStream
+}
+</pre>
+</div>
+
+<p>再配上一个通用阶段 <code>take</code>，只取前 num 个值然后退出：</p>
+
+<div class="code" data-lang="go">
+<pre>
+take := func(
+	done &lt;-chan interface{},
+	valueStream &lt;-chan interface{},
+	num int,
+) &lt;-chan interface{} {
+	takeStream := make(chan interface{})
+	go func() {
+		defer close(takeStream)
+		for i := 0; i &lt; num; i++ {
+			select {
+			case &lt;-done:
+				return
+			case takeStream &lt;- &lt;-valueStream:
+			}
+		}
+	}()
+	return takeStream
+}
+
+done := make(chan interface{})
+defer close(done)
+
+for num := range take(done, repeat(done, 1), 10) {
+	fmt.Printf("%v ", num) // 1 1 1 1 1 1 1 1 1 1
+}
+</pre>
+</div>
+
+<p>
+  <code>repeat</code> 能产生无限个 1，但因为它的发送会阻塞在 <code>take</code> 的接收上，实际只会生成 N+1 个（N 是传给 take 的数）。非常高效。再来一个反复调用函数的 <code>repeatFn</code>：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+repeatFn := func(
+	done &lt;-chan interface{},
+	fn func() interface{},
+) &lt;-chan interface{} {
+	valueStream := make(chan interface{})
+	go func() {
+		defer close(valueStream)
+		for {
+			select {
+			case &lt;-done:
+				return
+			case valueStream &lt;- fn():
+			}
+		}
+	}()
+	return valueStream
+}
+
+done := make(chan interface{})
+defer close(done)
+
+rand := func() interface{} { return rand.Int() }
+for num := range take(done, repeatFn(done, rand), 10) {
+	fmt.Println(num) // 按需生成的无限随机整数流，取前 10 个
+}
+</pre>
+</div>
+
+<div class="box trap">
+  <div class="t">&#9888; 深入一点：<code>case takeStream &lt;- &lt;-valueStream:</code> 不能被取消</div>
+  <p>
+    Go 规范规定：进入 <code>select</code> 时，所有 case 中<strong>接收操作的通道表达式、发送语句的通道和右侧的值，会先按顺序各求值一次</strong>。
+    所以 <code>takeStream &lt;- &lt;-valueStream</code> 里的 <code>&lt;-valueStream</code> 是在 <code>select</code> 开始「同时等待」<em>之前</em>就执行的 ——
+    如果上游迟迟不产出值，<code>take</code> 会卡在这里，<strong>即使 done 已经关闭也无法退出</strong>。（本笔记实测：done 在 50ms 时关闭，500ms 后 take 依然阻塞。）
+    同理，<code>case valueStream &lt;- fn():</code> 中的 <code>fn()</code> 也会在检查 done 之前先被调用。
+  </p>
+  <p>
+    在本书的例子里，上游都是会持续产出的生成器，所以不会出问题；但如果上游可能长时间阻塞，应该把接收也放进 select，像这样：
+  </p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="更稳妥的 take">
+<pre>
+for i := 0; i &lt; num; i++ {
+	select {
+	case &lt;-done:
+		return
+	case v, ok := &lt;-valueStream: // 接收本身也能被 done 打断
+		if !ok {
+			return // 上游关闭了，不要继续转发零值
+		}
+		select {
+		case &lt;-done:
+			return
+		case takeStream &lt;- v:
+		}
+	}
+}
+</pre>
+  </div>
+</div>
+
+<p>
+  为什么这些生成器和阶段都用 <code>interface{}</code>？作者认为，对管道阶段来说，用 <code>chan interface{}</code> 来建立一个「标准管道模式库」是可以接受的：
+  <code>repeat</code> 关心的是循环产生数据，<code>take</code> 关心的是限制数量，它们都不需要知道数据的类型，只需要知道参数的个数。
+  需要具体类型时，加一个做类型断言的阶段就行：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+toString := func(
+	done &lt;-chan interface{},
+	valueStream &lt;-chan interface{},
+) &lt;-chan string {
+	stringStream := make(chan string)
+	go func() {
+		defer close(stringStream)
+		for v := range valueStream {
+			select {
+			case &lt;-done:
+				return
+			case stringStream &lt;- v.(string):
+			}
+		}
+	}()
+	return stringStream
+}
+
+done := make(chan interface{})
+defer close(done)
+
+var message string
+for token := range toString(done, take(done, repeat(done, "I", "am."), 5)) {
+	message += token
+}
+fmt.Printf("message: %s...", message) // message: Iam.Iam.I...
+</pre>
+</div>
+
+<p>多一个阶段、多一次类型断言的开销有多大？书中的基准测试：</p>
+
+<div class="tw">
+<table>
+  <tr><th>基准</th><th>次数</th><th>耗时</th></tr>
+  <tr><td><code>BenchmarkGeneric</code>（interface{} 阶段 + toString）</td><td>1,000,000</td><td>2266 ns/op</td></tr>
+  <tr><td><code>BenchmarkTyped</code>（直接用 string 的阶段）</td><td>1,000,000</td><td>1181 ns/op</td></tr>
+</table>
+</div>
+
+<p>
+  类型化的阶段快了两倍，但在量级上只是略快。通常管道的瓶颈在生成器（读磁盘、网络 I/O）或某个计算密集的阶段，远远盖过这点开销。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：用泛型 + context 重写的管道工具箱 <span class="ver">Go 1.18+</span><span class="ver">Go 1.25+ wg.Go</span></div>
+  <p>
+    有了泛型，「通用」和「类型安全」不再需要二选一，也不需要 <code>toString</code>/<code>toInt</code> 这类断言阶段。下面是把本章各模式用泛型和 <code>context.Context</code>
+    重写后的版本（已在 Go 1.27 下通过 <code>go vet</code> 和 <code>-race</code> 测试）。注意每个阶段的<em>接收和发送</em>都在 select 里，可随时取消：
+  </p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="pipeline.go（现代写法）">
+<pre>
+// Generator 把一组值变成数据流。
+func Generator[T any](ctx context.Context, values ...T) &lt;-chan T {
+	out := make(chan T)
+	go func() {
+		defer close(out)
+		for _, v := range values {
+			select {
+			case &lt;-ctx.Done():
+				return
+			case out &lt;- v:
+			}
+		}
+	}()
+	return out
+}
+
+// Take 只取前 n 个值。
+func Take[T any](ctx context.Context, in &lt;-chan T, n int) &lt;-chan T {
+	out := make(chan T)
+	go func() {
+		defer close(out)
+		for range n { // Go 1.22+：range 整数
+			select {
+			case &lt;-ctx.Done():
+				return
+			case v, ok := &lt;-in:
+				if !ok {
+					return
+				}
+				select {
+				case &lt;-ctx.Done():
+					return
+				case out &lt;- v:
+				}
+			}
+		}
+	}()
+	return out
+}
+
+// Map 是通用的变换阶段：In 和 Out 可以是不同类型。
+func Map[In, Out any](ctx context.Context, in &lt;-chan In, f func(In) Out) &lt;-chan Out {
+	out := make(chan Out)
+	go func() {
+		defer close(out)
+		for v := range OrDone(ctx, in) {
+			select {
+			case &lt;-ctx.Done():
+				return
+			case out &lt;- f(v):
+			}
+		}
+	}()
+	return out
+}
+
+// 用法：书中的 ×2、+1、×2 管道
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+double := func(v int) int { return v * 2 }
+p := Map(ctx, Map(ctx, Map(ctx, Generator(ctx, 1, 2, 3, 4), double),
+	func(v int) int { return v + 1 }), double)
+for v := range p {
+	fmt.Print(v, " ") // 6 10 14 18
+}
+</pre>
+  </div>
+  <p>
+    还有一个重要提醒：<strong>如果你只是想「逐个产出值」而不需要并发</strong>，Go 1.23 的迭代器 <code>iter.Seq[T]</code> 比通道更合适 ——
+    没有 goroutine、没有泄漏风险、快得多。通道管道的价值在于「各阶段真正并发执行」，比如阶段里有 I/O 或重计算、需要扇出时。
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="fan">扇出，扇入（Fan-Out, Fan-In）</h2>
+
+<p>
+  管道搭好了，数据在各阶段之间流动……但流得很慢，到底为什么这么慢？有时管道中的某些阶段计算量特别大，上游阶段在等它时会被阻塞，整个管道也要跑很久。
+</p>
+
+<p>
+  管道的一个有趣性质是：阶段可以被<strong>复用</strong>。如果在多个 goroutine 上复用同一个阶段，并行地从上游拉取数据呢？这个模式就叫<strong>扇出扇入</strong>：
+</p>
+<ul>
+  <li><strong>扇出（fan-out）</strong>：启动多个 goroutine 来处理来自管道的输入；</li>
+  <li><strong>扇入（fan-in）</strong>：把多个结果合并到一个通道里。</li>
+</ul>
+
+<p>什么样的阶段适合扇出？下面两条<strong>同时满足</strong>时：</p>
+<ul>
+  <li>它<strong>不依赖</strong>本阶段之前计算出的值（顺序无关）；</li>
+  <li>它<strong>运行时间很长</strong>。</li>
+</ul>
+<p>顺序无关很重要，因为你无法保证阶段的并发副本以什么顺序运行、以什么顺序返回。书中用一个故意很低效的找素数程序演示：</p>
+
+<div class="code" data-lang="go" data-file="fan-out-fan-in/fig-naive-prime-finder.go（节选）">
+<pre>
+rand := func() interface{} { return rand.Intn(50000000) }
+
+done := make(chan interface{})
+defer close(done)
+
+start := time.Now()
+
+randIntStream := toInt(done, repeatFn(done, rand))
+fmt.Println("Primes:")
+for prime := range take(done, primeFinder(done, randIntStream), 10) {
+	fmt.Printf("\t%d\n", prime)
+}
+
+fmt.Printf("Search took: %v", time.Since(start)) // Search took: 23.437511647s
+</pre>
+</div>
+
+<p>
+  <code>primeFinder</code> 天真地拿输入的数去除以比它小的每个数，非常慢，正好满足「耗时长」。随机数生成器顺序无关但很快；<code>primeFinder</code> 顺序无关（一个数是不是素数和顺序无关）又很慢 —— 是扇出的好候选。
+  扇出非常简单，启动多个这个阶段的副本就行：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+numFinders := runtime.NumCPU() // 作者的机器上是 8
+finders := make([]&lt;-chan interface{}, numFinders)
+for i := 0; i &lt; numFinders; i++ {
+	finders[i] = primeFinder(done, randIntStream) // 8 个 goroutine 从同一个随机数流里抢数
+}
+</pre>
+</div>
+
+<p>现在有 8 个 goroutine、8 个结果通道，但后面的 range 只接受一个通道。这就需要扇入 —— 把多个数据流多路复用成一个：</p>
+
+<div class="code" data-lang="go" data-file="fan-out-fan-in/fig-fan-out-naive-prime-finder.go（节选）">
+<pre>
+fanIn := func(
+	done &lt;-chan interface{},
+	channels ...&lt;-chan interface{},
+) &lt;-chan interface{} { // ① 标准的 done 通道 + 要合并的一组通道
+	var wg sync.WaitGroup // ② 用来等待所有通道都被读完
+	multiplexedStream := make(chan interface{})
+
+	multiplex := func(c &lt;-chan interface{}) { // ③ 从一个通道读，转发到 multiplexedStream
+		defer wg.Done()
+		for i := range c {
+			select {
+			case &lt;-done:
+				return
+			case multiplexedStream &lt;- i:
+			}
+		}
+	}
+
+	// 从所有通道读
+	wg.Add(len(channels)) // ④ 每个通道一个 multiplex goroutine
+	for _, c := range channels {
+		go multiplex(c)
+	}
+
+	// 等所有读取完成后关闭输出通道
+	go func() { // ⑤ 所有输入通道都耗尽后，关闭合并后的通道
+		wg.Wait()
+		close(multiplexedStream)
+	}()
+
+	return multiplexedStream
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="扇出：多个 primeFinder 从同一个输入流取数；扇入：把它们的输出合并为一个流">
+  <rect class="bx-g" x="14" y="120" width="130" height="60" rx="10"/>
+  <text class="ttl on-g" x="79" y="144" text-anchor="middle">随机数生成</text><text class="sm" x="79" y="164" text-anchor="middle">randIntStream</text>
+  <!-- fan-out -->
+  <path class="ln-c" d="M146 150 C 200 150, 200 40, 250 40" marker-end="url(#ar-c)"/>
+  <path class="ln-c" d="M146 150 C 200 150, 200 95, 250 95" marker-end="url(#ar-c)"/>
+  <path class="ln-c" d="M146 150 C 200 150, 200 150, 250 150" marker-end="url(#ar-c)"/>
+  <path class="ln-c" d="M146 150 C 200 150, 200 205, 250 205" marker-end="url(#ar-c)"/>
+  <path class="ln-c" d="M146 150 C 200 150, 200 260, 250 260" marker-end="url(#ar-c)"/>
+  <text class="ttl on-c" x="196" y="22" text-anchor="middle">扇出</text>
+  <rect class="bx-b" x="254" y="24" width="140" height="32" rx="8"/><text class="mono on-b" x="324" y="45" text-anchor="middle">primeFinder #1</text>
+  <rect class="bx-b" x="254" y="79" width="140" height="32" rx="8"/><text class="mono on-b" x="324" y="100" text-anchor="middle">primeFinder #2</text>
+  <rect class="bx-b" x="254" y="134" width="140" height="32" rx="8"/><text class="mono on-b" x="324" y="155" text-anchor="middle">primeFinder #3</text>
+  <rect class="bx-b" x="254" y="189" width="140" height="32" rx="8"/><text class="mono on-b" x="324" y="210" text-anchor="middle">…</text>
+  <rect class="bx-b" x="254" y="244" width="140" height="32" rx="8"/><text class="mono on-b" x="324" y="265" text-anchor="middle">primeFinder #8</text>
+  <!-- fan-in -->
+  <path class="ln-p" d="M396 40 C 450 40, 450 150, 500 150"/>
+  <path class="ln-p" d="M396 95 C 450 95, 450 150, 500 150"/>
+  <path class="ln-p" d="M396 150 H500"/>
+  <path class="ln-p" d="M396 205 C 450 205, 450 150, 500 150"/>
+  <path class="ln-p" d="M396 260 C 450 260, 450 150, 500 150"/>
+  <text class="ttl on-p" x="450" y="22" text-anchor="middle">扇入</text>
+  <rect class="bx-p" x="502" y="122" width="100" height="56" rx="10"/>
+  <text class="ttl on-p" x="552" y="146" text-anchor="middle">fanIn</text><text class="sm" x="552" y="166" text-anchor="middle">多路复用</text>
+  <path class="ln-p" d="M604 150 H636" marker-end="url(#ar-p)"/>
+  <rect class="bx-a" x="640" y="122" width="110" height="56" rx="10"/>
+  <text class="ttl on-a" x="695" y="146" text-anchor="middle">take(10)</text><text class="sm" x="695" y="166" text-anchor="middle">23s → 5.4s</text>
+</svg>
+<figcaption>图 4-8　扇出扇入：慢阶段开多份并行处理，再把结果汇合成一个流</figcaption>
+</figure>
+
+<div class="box warn">
+  <div class="t">&#9888; 再提醒一次：顺序会乱</div>
+  <p>朴素的扇出扇入只在结果到达顺序无关紧要时才适用。我们没有做任何事来保证从 <code>randIntStream</code> 读出的顺序在经过筛选后被保留。</p>
+</div>
+
+<p>
+  全部组合起来，用时从约 23 秒降到约 5 秒，减少了约 78%，而程序结构几乎没变。这充分说明了扇出扇入的好处，也再次证明了管道的价值。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：扇入的现代写法 <span class="ver">Go 1.25+</span></div>
+  <div class="code" data-lang="go" data-tone="modern" data-file="FanIn（泛型 + wg.Go）">
+<pre>
+func FanIn[T any](ctx context.Context, chans ...&lt;-chan T) &lt;-chan T {
+	var wg sync.WaitGroup
+	out := make(chan T)
+	for _, c := range chans {
+		wg.Go(func() { // Go 1.22+ 循环变量 c 每轮独立
+			for v := range OrDone(ctx, c) {
+				select {
+				case &lt;-ctx.Done():
+					return
+				case out &lt;- v:
+				}
+			}
+		})
+	}
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
+}
+</pre>
+  </div>
+  <p>另外，书中的 <code>rand.Intn</code> 在 Go 1.20 前用的是固定种子；如今推荐 <code>math/rand/v2</code>（Go 1.22+）的 <code>rand.IntN</code>，它的全局函数并发安全且自动随机播种。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="or-done">or-done-channel</h2>
+
+<p>
+  有时你要处理来自系统各个角落的通道。和管道不同，你无法断言：当你的代码通过 done 被取消时，你正在读的那个通道会不会也被关闭。
+  所以就像「防止泄漏」里说的，要把读操作包在一个同时 select done 的语句里。这没问题，但会把这样易读的代码：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+for val := range myChan {
+	// 用 val 做点什么
+}
+</pre>
+</div>
+
+<p>膨胀成这样：</p>
+
+<div class="code" data-lang="go">
+<pre>
+loop:
+for {
+	select {
+	case &lt;-done:
+		break loop
+	case maybeVal, ok := &lt;-myChan:
+		if ok == false {
+			return // 或者 break loop
+		}
+		// 用 val 做点什么
+	}
+}
+</pre>
+</div>
+
+<p>嵌套循环时更是一团糟。延续「用 goroutine 写更清晰的并发代码、不要过早优化」的思路，用一个 goroutine 把啰嗦的部分封装起来：</p>
+
+<div class="code" data-lang="go">
+<pre>
+orDone := func(done, c &lt;-chan interface{}) &lt;-chan interface{} {
+	valStream := make(chan interface{})
+	go func() {
+		defer close(valStream)
+		for {
+			select {
+			case &lt;-done:
+				return
+			case v, ok := &lt;-c:
+				if ok == false {
+					return
+				}
+				select {
+				case valStream &lt;- v:
+				case &lt;-done:
+				}
+			}
+		}
+	}()
+	return valStream
+}
+
+// 于是又可以写简单的 for 循环了：
+for val := range orDone(done, myChan) {
+	// 用 val 做点什么
+}
+</pre>
+</div>
+
+<p>你也许会在代码的某些边角需要用一连串 select 写成的紧凑循环，但作者鼓励先追求可读性，避免过早优化。</p>
+
+<!-- ============================================================ -->
+<h2 id="tee">tee-channel</h2>
+
+<p>
+  有时你想把一个通道里的值<strong>分成两份</strong>，送到代码的两个不同区域。比如一个用户命令流：一份发给执行命令的部分，一份发给记录日志以备审计的部分。
+  tee-channel 得名于 Unix 的 <code>tee</code> 命令，传给它一个要读的通道，它返回两个会收到相同值的通道：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+tee := func(
+	done &lt;-chan interface{},
+	in &lt;-chan interface{},
+) (_, _ &lt;-chan interface{}) {
+	out1 := make(chan interface{})
+	out2 := make(chan interface{})
+	go func() {
+		defer close(out1)
+		defer close(out2)
+		for val := range orDone(done, in) {
+			var out1, out2 = out1, out2 // ① 遮蔽成局部变量
+			for i := 0; i &lt; 2; i++ {    // ② 用同一个 select 循环两次，两边写入互不阻塞
+				select {
+				case &lt;-done:
+				case out1 &lt;- val:
+					out1 = nil // ③ 写过的那边置为 nil，之后的写会阻塞，让另一边继续
+				case out2 &lt;- val:
+					out2 = nil
+				}
+			}
+		}
+	}()
+	return out1, out2
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="tee 把一个输入通道的每个值复制到两个输出通道">
+  <rect class="bx-g" x="20" y="80" width="120" height="50" rx="10"/><text class="ttl on-g" x="80" y="110" text-anchor="middle">in</text>
+  <path class="ln-c flow" d="M142 105 H228" marker-end="url(#ar-c)"/>
+  <rect class="bx-a" x="232" y="60" width="200" height="90" rx="12"/>
+  <text class="ttl on-a" x="332" y="84" text-anchor="middle">tee</text>
+  <text class="sm" x="332" y="104" text-anchor="middle">每个值写两次（out1、out2 各一次）</text>
+  <text class="sm" x="332" y="122" text-anchor="middle">写完一边就把它设为 nil</text>
+  <text class="sm" x="332" y="138" text-anchor="middle">（nil 通道在 select 里永远不就绪）</text>
+  <path class="ln-c flow" d="M434 90 C 480 90, 480 50, 530 50" marker-end="url(#ar-c)"/>
+  <path class="ln-c flow" d="M434 120 C 480 120, 480 160, 530 160" marker-end="url(#ar-c)"/>
+  <rect class="bx-b" x="534" y="26" width="206" height="48" rx="10"/><text class="ttl on-b" x="637" y="48" text-anchor="middle">out1</text><text class="sm" x="637" y="66" text-anchor="middle">例如：执行命令</text>
+  <rect class="bx-p" x="534" y="136" width="206" height="48" rx="10"/><text class="ttl on-p" x="637" y="158" text-anchor="middle">out2</text><text class="sm" x="637" y="176" text-anchor="middle">例如：写审计日志</text>
+  <text class="sm" x="380" y="204" text-anchor="middle">两边都写完，才会读 in 的下一个值：两个输出的消费速度被耦合在一起</text>
+</svg>
+<figcaption>图 4-9　tee-channel：一进两出</figcaption>
+</figure>
+
+<p>
+  注意 out1 和 out2 的写入是紧密耦合的：两边都写完之前，不会继续读 <code>in</code>。通常这不是问题 —— 处理每个读者的吞吐量本就不该是 tee 关心的事 —— 但值得留意。用法：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+done := make(chan interface{})
+defer close(done)
+
+out1, out2 := tee(done, take(done, repeat(done, 1, 2), 4))
+
+for val1 := range out1 {
+	fmt.Printf("out1: %v, out2: %v\n", val1, &lt;-out2)
+}
+// out1: 1, out2: 1
+// out1: 2, out2: 2
+// out1: 1, out2: 1
+// out1: 2, out2: 2
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#10003; 「把通道设为 nil 来禁用 select 的某个 case」</div>
+  <p>
+    这是一个非常实用的技巧：nil 通道上的发送和接收永远阻塞，所以在 select 里它对应的 case 永远不会被选中。
+    想「暂时关掉」某个 case 时，把那个变量设成 nil 就行。第 3 章讲 nil 通道时「永远阻塞」听起来是缺点，这里却成了特性。
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="bridge">bridge-channel</h2>
+
+<p>有时你想从一个<strong>通道的序列</strong>里消费值：</p>
+
+<div class="code" data-lang="go">
+<pre>
+&lt;-chan &lt;-chan interface{}
+</pre>
+</div>
+
+<p>
+  这和把一组通道合并成一个（or-channel、扇入）不同：通道的序列意味着<strong>有序的写入</strong>，只不过来自不同的来源。
+  比如一个生命周期断断续续的管道阶段：按照「约束」的原则，通道由写它的 goroutine 拥有，那么每次阶段在新 goroutine 里重启，就会创建一个新通道 —— 于是得到一串通道。
+  第 5 章「自愈的 goroutine」会遇到这个场景。
+</p>
+
+<p>消费者也许不关心值来自一串通道，处理「通道的通道」很麻烦。定义一个函数把它<strong>解构</strong>成一个简单的通道（这叫<strong>桥接</strong>），消费者就能专注于真正的问题：</p>
+
+<div class="code" data-lang="go" data-file="the-bridge-channel/fig-bridge-channel.go（节选）">
+<pre>
+bridge := func(
+	done &lt;-chan interface{},
+	chanStream &lt;-chan &lt;-chan interface{},
+) &lt;-chan interface{} {
+	valStream := make(chan interface{}) // ① bridge 返回的所有值都从这里出去
+	go func() {
+		defer close(valStream)
+		for { // ② 负责从 chanStream 里取出一个个通道
+			var stream &lt;-chan interface{}
+			select {
+			case maybeStream, ok := &lt;-chanStream:
+				if ok == false {
+					return
+				}
+				stream = maybeStream
+			case &lt;-done:
+				return
+			}
+			for val := range orDone(done, stream) { // ③ 读完当前通道的值，转发到 valStream；当前通道关闭后，回到外层取下一个
+				select {
+				case valStream &lt;- val:
+				case &lt;-done:
+				}
+			}
+		}
+	}()
+	return valStream
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="bridge 把通道的通道按顺序拍平成一个连续的值流">
+  <text class="lbl" x="20" y="24">chanStream：一串通道，按顺序到来</text>
+  <rect class="bx-d" x="20" y="36" width="330" height="140" rx="12"/>
+  <rect class="bx-c" x="40" y="56" width="90" height="34" rx="17"/><text class="mono on-c" x="85" y="78" text-anchor="middle">ch1: 0</text>
+  <rect class="bx-c" x="140" y="56" width="90" height="34" rx="17"/><text class="mono on-c" x="185" y="78" text-anchor="middle">ch2: 1</text>
+  <rect class="bx-c" x="240" y="56" width="90" height="34" rx="17"/><text class="mono on-c" x="285" y="78" text-anchor="middle">ch3: 2</text>
+  <rect class="bx-c" x="40" y="110" width="90" height="34" rx="17"/><text class="mono on-c" x="85" y="132" text-anchor="middle">ch4: 3</text>
+  <rect class="bx-c" x="140" y="110" width="90" height="34" rx="17"/><text class="mono on-c" x="185" y="132" text-anchor="middle">…</text>
+  <rect class="bx-c" x="240" y="110" width="90" height="34" rx="17"/><text class="mono on-c" x="285" y="132" text-anchor="middle">ch10: 9</text>
+  <text class="sm" x="185" y="166" text-anchor="middle">每个通道写入一个值后关闭</text>
+  <path class="ln-a" d="M352 106 H408" marker-end="url(#ar-a)"/>
+  <rect class="bx-a" x="412" y="76" width="120" height="60" rx="12"/>
+  <text class="ttl on-a" x="472" y="102" text-anchor="middle">bridge</text><text class="sm" x="472" y="122" text-anchor="middle">逐个读空、再取下一个</text>
+  <path class="ln-g flow" d="M534 106 H590" marker-end="url(#ar-g)"/>
+  <rect class="bx-g" x="594" y="76" width="150" height="60" rx="12"/>
+  <text class="ttl on-g" x="669" y="100" text-anchor="middle">valStream</text><text class="mono" x="669" y="122" text-anchor="middle">0 1 2 3 … 9</text>
+  <text class="lbl" x="380" y="200" text-anchor="middle">消费者只看到一个连续的流，不用关心值来自哪个通道</text>
+</svg>
+<figcaption>图 4-10　bridge-channel：把「通道的通道」拍平</figcaption>
+</figure>
+
+<div class="code" data-lang="go">
+<pre>
+genVals := func() &lt;-chan &lt;-chan interface{} {
+	chanStream := make(chan (&lt;-chan interface{}))
+	go func() {
+		defer close(chanStream)
+		for i := 0; i &lt; 10; i++ {
+			stream := make(chan interface{}, 1)
+			stream &lt;- i
+			close(stream)
+			chanStream &lt;- stream
+		}
+	}()
+	return chanStream
+}
+
+for v := range bridge(nil, genVals()) {
+	fmt.Printf("%v ", v) // 0 1 2 3 4 5 6 7 8 9
+}
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="queuing">队列（Queuing）</h2>
+
+<p>
+  有时，即使管道还没准备好处理，也要先开始接收工作 —— 这叫<strong>排队</strong>：某个阶段完成工作后，把结果存在内存里的临时位置，
+  让其他阶段稍后取走，本阶段不需要一直持有它。第 3 章的带缓冲通道就是一种队列，但我们一直很少用它，这是有原因的。
+</p>
+
+<div class="box warn">
+  <div class="t">&#9888; 队列通常是你最后才该考虑的优化</div>
+  <p>
+    过早加入队列会<strong>掩盖死锁、活锁这类同步问题</strong>；而且随着程序逐渐正确，你会发现需要的队列大小也在变。
+    一个常见错误是：<strong>为了解决性能问题而加队列</strong>。队列几乎从不会缩短程序的总运行时间，它只是让程序的行为变得不同。
+  </p>
+</div>
+
+<p>来看一个简单的管道（作者用的是示意性的伪代码）：</p>
+
+<div class="code" data-lang="go">
+<pre>
+done := make(chan interface{})
+defer close(done)
+
+zeros := take(done, 3, repeat(done, 0))    // 1、2：无穷个 0，只取 3 个
+short := sleep(done, 1*time.Second, zeros) // 3：「短」阶段，每个值睡 1 秒
+long := sleep(done, 4*time.Second, short)  // 4：「长」阶段，每个值睡 4 秒
+pipeline := long
+</pre>
+</div>
+
+<p>假设前两个阶段是瞬间完成的。然后在 short 和 long 之间加一个容量为 2 的缓冲：</p>
+
+<div class="code" data-lang="go">
+<pre>
+zeros := take(done, 3, repeat(done, 0))
+short := sleep(done, 1*time.Second, zeros)
+buffer := buffer(done, 2, short)          // 把 short 的输出缓冲 2 个
+long := sleep(done, 4*time.Second, buffer) // 书中此处误写为 short，应为 buffer
+pipeline := long
+</pre>
+</div>
+
+<figure class="wide">
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="加缓冲前后短阶段和长阶段的时间线对比">
+  <!-- 刻度 x = 150 + t*44 -->
+  <text class="ttl" x="20" y="24">不加缓冲</text>
+  <text class="lbl" x="20" y="58">short（1s）</text>
+  <text class="lbl" x="20" y="92">long（4s）</text>
+  <rect class="bx-b" x="150" y="42" width="44" height="24" rx="4"/><text class="sm on-b" x="172" y="58" text-anchor="middle">#1</text>
+  <rect class="bx-b" x="194" y="42" width="44" height="24" rx="4"/><text class="sm on-b" x="216" y="58" text-anchor="middle">#2</text>
+  <rect class="bx-r" x="238" y="42" width="132" height="24" rx="4"/><text class="sm on-r" x="304" y="58" text-anchor="middle">阻塞：long 还没收</text>
+  <rect class="bx-b" x="370" y="42" width="44" height="24" rx="4"/><text class="sm on-b" x="392" y="58" text-anchor="middle">#3</text>
+  <rect class="bx-r" x="414" y="42" width="132" height="24" rx="4"/><text class="sm on-r" x="480" y="58" text-anchor="middle">阻塞</text>
+  <text class="sm" x="550" y="58">关闭（t=9s）</text>
+  <rect class="bx-p" x="194" y="76" width="176" height="24" rx="4"/><text class="sm on-p" x="282" y="92" text-anchor="middle">#1</text>
+  <rect class="bx-p" x="370" y="76" width="176" height="24" rx="4"/><text class="sm on-p" x="458" y="92" text-anchor="middle">#2</text>
+  <rect class="bx-p" x="546" y="76" width="176" height="24" rx="4"/><text class="sm on-p" x="634" y="92" text-anchor="middle">#3（t=13s 结束）</text>
+
+  <text class="ttl" x="20" y="144">加 2 个缓冲</text>
+  <text class="lbl" x="20" y="178">short（1s）</text>
+  <text class="lbl" x="20" y="212">缓冲区</text>
+  <text class="lbl" x="20" y="246">long（4s）</text>
+  <rect class="bx-b" x="150" y="162" width="44" height="24" rx="4"/><text class="sm on-b" x="172" y="178" text-anchor="middle">#1</text>
+  <rect class="bx-b" x="194" y="162" width="44" height="24" rx="4"/><text class="sm on-b" x="216" y="178" text-anchor="middle">#2</text>
+  <rect class="bx-b" x="238" y="162" width="44" height="24" rx="4"/><text class="sm on-b" x="260" y="178" text-anchor="middle">#3</text>
+  <text class="sm on-g" x="290" y="178">关闭（t=3s）✓ 提前 6 秒解放</text>
+  <rect class="bx-y" x="238" y="196" width="44" height="24" rx="4"/><text class="sm on-y" x="260" y="212" text-anchor="middle">1/2</text>
+  <rect class="bx-y" x="282" y="196" width="88" height="24" rx="4"/><text class="sm on-y" x="326" y="212" text-anchor="middle">2/2</text>
+  <rect class="bx-y" x="370" y="196" width="176" height="24" rx="4"/><text class="sm on-y" x="458" y="212" text-anchor="middle">1/2</text>
+  <rect class="bx" x="546" y="196" width="176" height="24" rx="4"/><text class="sm" x="634" y="212" text-anchor="middle">0/2</text>
+  <rect class="bx-p" x="194" y="230" width="176" height="24" rx="4"/><text class="sm on-p" x="282" y="246" text-anchor="middle">#1</text>
+  <rect class="bx-p" x="370" y="230" width="176" height="24" rx="4"/><text class="sm on-p" x="458" y="246" text-anchor="middle">#2</text>
+  <rect class="bx-p" x="546" y="230" width="176" height="24" rx="4"/><text class="sm on-p" x="634" y="246" text-anchor="middle">#3（t=13s 结束）</text>
+
+  <path class="ln" d="M150 270 H730" marker-end="url(#ar)"/>
+  <text class="sm" x="150" y="286" text-anchor="middle">0</text><text class="sm" x="282" y="286" text-anchor="middle">3s</text>
+  <text class="sm" x="546" y="286" text-anchor="middle">9s</text><text class="sm" x="722" y="286" text-anchor="middle">13s</text>
+</svg>
+<figcaption>图 4-11　整条管道都是 13 秒，但 short 阶段在加缓冲后 3 秒就完成了</figcaption>
+</figure>
+
+<p>
+  整个管道依然用了 13 秒！但 short 阶段只用了 3 秒而不是 9 秒，运行时间缩短了三分之二。既然总时间没变，这有什么用？想象这样的管道：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+p := processRequest(done, acceptConnection(done, httpHandler))
+</pre>
+</div>
+
+<p>
+  这个管道在被取消之前不会退出，接受连接的阶段也会一直接受连接。你肯定不希望因为 <code>processRequest</code> 阻塞了 <code>acceptConnection</code>，导致用户的连接开始超时。
+  所以队列的意义<strong>不是缩短某个阶段的运行时间，而是缩短它处于阻塞状态的时间</strong>，让它能继续干自己的活。用户可能会感到延迟，但至少不会被直接拒绝服务。
+</p>
+
+<div class="box key">
+  <div class="t">&#9733; 队列的真正用途：解耦阶段</div>
+  <p>让一个阶段的运行时间不影响另一个阶段的运行时间。这种解耦会级联地改变整个系统的运行时行为 —— 好坏取决于你的系统。</p>
+</div>
+
+<h3 id="queue-when">队列能提升整体性能的两种情况</h3>
+<ul>
+  <li><strong>在某个阶段批量处理请求能节省时间时；</strong></li>
+  <li><strong>某个阶段的延迟会在系统中形成反馈回路时。</strong></li>
+</ul>
+
+<p>
+  第一种情况的例子：把输入先缓冲在比目标更快的介质里（比如先写内存，再写磁盘）。这正是 Go 的 <code>bufio</code> 包存在的意义：
+</p>
+
+<div class="code" data-lang="go" data-file="queuing/buffering_test.go（节选）">
+<pre>
+func BenchmarkUnbufferedWrite(b *testing.B) {
+	performWrite(b, tmpFileOrFatal())
+}
+
+func BenchmarkBufferedWrite(b *testing.B) {
+	bufferredFile := bufio.NewWriter(tmpFileOrFatal())
+	performWrite(b, bufio.NewWriter(bufferredFile))
+}
+
+func tmpFileOrFatal() *os.File {
+	file, err := ioutil.TempFile("", "tmp")
+	if err != nil {
+		log.Fatal("error: %v", err)
+	}
+	return file
+}
+
+func performWrite(b *testing.B, writer io.Writer) {
+	done := make(chan interface{})
+	defer close(done)
+
+	b.ResetTimer()
+	for bt := range take(done, repeat(done, byte(0)), b.N) {
+		writer.Write([]byte{bt.(byte)}) // 每次只写 1 个字节
+	}
+}
+</pre>
+</div>
+
+<div class="tw">
+<table>
+  <tr><th>基准</th><th>次数</th><th>耗时</th></tr>
+  <tr><td><code>BenchmarkUnbufferedWrite-8</code></td><td>500,000</td><td>3969 ns/op</td></tr>
+  <tr><td><code>BenchmarkBufferedWrite-8</code></td><td>1,000,000</td><td>1356 ns/op</td></tr>
+</table>
+</div>
+
+<p>
+  带缓冲的写更快，因为 <code>bufio.Writer</code> 把写入先排进缓冲区，攒够一大块再一次性写出。这叫<strong>分块（chunking）</strong>。
+  一般来说，只要执行某个操作有固定开销，分块就可能提升性能：开数据库事务、计算消息校验和、分配连续空间等。
+  此外，如果算法能借助「回看」或排序来优化，队列也有帮助。
+</p>
+
+<div class="box deep">
+  <div class="t">&#128270; 补充：分块快的主要原因是「系统调用变少了」</div>
+  <p>
+    书中把原因解释为「bytes.Buffer 需要增长内存」，这个说法不太准确。对文件而言，未缓冲时每写 1 个字节就是一次 <code>write</code> 系统调用；
+    <code>bufio.Writer</code> 默认攒满 4096 字节才调用一次，系统调用次数减少了几千倍，这才是主要收益（两者的耗时都还包含了管道里通道传递的开销，所以差距没有那么夸张）。
+    另外这段测试代码有几处小问题：<code>log.Fatal("error: %v", err)</code> 应为 <code>log.Fatalf</code>；<code>bufio.NewWriter</code> 被包了两层；
+    <code>ioutil.TempFile</code> 已弃用，应换成 <code>os.CreateTemp</code>；也没有在结束时 <code>Flush</code> 和删除临时文件。
+  </p>
+</div>
+
+<p>
+  第二种情况更难发现，但更重要，因为它会导致上游系统<strong>崩溃式的连锁反应</strong>：常被称为<strong>负反馈回路、螺旋下降，甚至死亡螺旋</strong>。
+  管道与上游系统之间存在一种递推关系：上游提交新请求的速率，某种程度上与管道的效率挂钩。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="死亡螺旋：处理变慢导致请求堆积，请求堆积又让处理更慢">
+  <rect class="bx-r" x="290" y="20" width="180" height="46" rx="10"/>
+  <text class="ttl on-r" x="380" y="48" text-anchor="middle">管道效率下降</text>
+  <rect class="bx-r" x="520" y="96" width="220" height="46" rx="10"/>
+  <text class="ttl on-r" x="630" y="124" text-anchor="middle">请求超时，客户端重试</text>
+  <rect class="bx-r" x="290" y="172" width="180" height="46" rx="10"/>
+  <text class="ttl on-r" x="380" y="200" text-anchor="middle">流入的请求更多了</text>
+  <rect class="bx-r" x="20" y="96" width="220" height="46" rx="10"/>
+  <text class="ttl on-r" x="130" y="124" text-anchor="middle">还在处理已经失效的请求</text>
+  <path class="ln-r" d="M472 44 C 560 44, 620 60, 630 92" marker-end="url(#ar-r)"/>
+  <path class="ln-r" d="M630 144 C 620 180, 560 196, 474 196" marker-end="url(#ar-r)"/>
+  <path class="ln-r" d="M288 196 C 200 196, 140 180, 130 146" marker-end="url(#ar-r)"/>
+  <path class="ln-r" d="M130 94 C 140 60, 200 44, 286 44" marker-end="url(#ar-r)"/>
+  <text class="ttl on-r" x="380" y="122" text-anchor="middle">死亡螺旋</text>
+  <text class="sm" x="380" y="234" text-anchor="middle">解法：在管道入口加队列，以「延迟」换取稳定；出队时检查请求是否仍然有效</text>
+</svg>
+<figcaption>图 4-12　负反馈回路：没有保险机制，系统永远无法恢复</figcaption>
+</figure>
+
+<p>
+  在管道入口加一个队列，就能以「请求有延迟」为代价打破这个反馈回路：从调用者看来，请求在处理中，只是很慢。只要调用者不超时，管道就能保持稳定。
+  如果调用者<em>会</em>超时，出队时一定要检查请求是否仍然有效；否则处理已经失效的请求会降低效率，不经意间又形成了反馈回路。
+</p>
+
+<div class="box deep">
+  <div class="t">&#128270; 你见过死亡螺旋吗？</div>
+  <p>
+    如果你在某个新系统刚上线时访问过它（新游戏服务器、产品发布网站……），网站反复宕机，开发者想尽办法也不行 —— 恭喜，你多半见证了负反馈回路。
+    开发团队总会尝试各种办法，直到有人意识到需要一个队列，然后匆忙实现一个。然后用户开始抱怨排队时间太长！
+  </p>
+</div>
+
+<p>所以，队列应该放在：</p>
+<ul>
+  <li><strong>管道的入口</strong>；</li>
+  <li><strong>批处理能提高效率的阶段</strong>。</li>
+</ul>
+<p>别忍不住在别处加队列（比如某个计算量大的阶段之后）。要理解为什么，得讨论管道的吞吐量 —— 这也能帮我们决定队列该多大。</p>
+
+<h3 id="little">利特尔法则（Little's Law）</h3>
+
+<p>排队论里有一条定律，只要采样足够，就能预测管道的吞吐量：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="利特尔法则 L 等于 lambda 乘以 W">
+  <text class="ttl" x="380" y="44" text-anchor="middle" style="font-size:26px">L = λ × W</text>
+  <rect class="bx-b" x="40" y="80" width="200" height="80" rx="10"/>
+  <text class="ttl on-b" x="140" y="106" text-anchor="middle">L</text>
+  <text class="sm" x="140" y="128" text-anchor="middle">系统中平均有多少个</text>
+  <text class="sm" x="140" y="146" text-anchor="middle">工作单元（含排队的）</text>
+  <rect class="bx-g" x="280" y="80" width="200" height="80" rx="10"/>
+  <text class="ttl on-g" x="380" y="106" text-anchor="middle">λ（lambda）</text>
+  <text class="sm" x="380" y="128" text-anchor="middle">工作单元的平均到达速率</text>
+  <text class="sm" x="380" y="146" text-anchor="middle">（稳定系统里 = 离开速率）</text>
+  <rect class="bx-p" x="520" y="80" width="200" height="80" rx="10"/>
+  <text class="ttl on-p" x="620" y="106" text-anchor="middle">W</text>
+  <text class="sm" x="620" y="128" text-anchor="middle">一个工作单元在系统中</text>
+  <text class="sm" x="620" y="146" text-anchor="middle">平均停留多久</text>
+  <text class="lbl" x="380" y="190" text-anchor="middle">只适用于「稳定」系统：进入速率（ingress）= 离开速率（egress）</text>
+</svg>
+<figcaption>图 4-13　利特尔法则</figcaption>
+</figure>
+
+<p>
+  如果进入速率大于离开速率，系统不稳定，进入了死亡螺旋；如果小于，也不稳定，只是资源没被充分利用（规模大到集群、数据中心时才需要在意）。
+</p>
+
+<p>假设管道是稳定的，从这个公式能推出几件事：</p>
+<ul>
+  <li>想把 W（平均停留时间）降低 n 倍，唯一的办法是把 L 也降低 n 倍：<code>L/n = λ × W/n</code>。而要降低 L，只能<strong>提高离开速率</strong>。</li>
+  <li>如果在阶段里加队列，等于增大了 L：要么到达速率随之变大（<code>nL = nλ × W</code>），要么停留时间变长（<code>nL = λ × nW</code>）。
+    <strong>利特尔法则证明了：队列无法减少工作在系统中停留的时间。</strong></li>
+  <li>从整体看管道，W 分布在所有阶段上：<code>L = λ × ΣWᵢ</code>。换句话说，<strong>管道只能和最慢的阶段一样快</strong>。不要不加区分地优化！</li>
+</ul>
+
+<p>用它算两道题（设管道有 3 个阶段）：</p>
+
+<div class="tw">
+<table>
+  <tr><th>问题</th><th>已知</th><th>计算</th></tr>
+  <tr><td>管道每秒能处理多少请求？</td><td>每个阶段都在处理一个请求，L = 3；采样得一个请求穿过管道约 1 秒，W = 1s</td><td>3 = λ × 1s → <strong>λ = 3 个/秒</strong></td></tr>
+  <tr><td>要处理每秒 10 万个请求，队列要多大？</td><td>λ = 100,000/s；每个请求处理用时 W = 0.1ms（0.0001s）</td><td>L = 100,000 × 0.0001 = 10；3 个在阶段里 → <strong>队列容量 = 10 − 3 = 7</strong></td></tr>
+</table>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 关于书中这道题的数字</div>
+  <p>
+    书中正文写的是「处理一个请求需要 1ms」，但代入的却是 0.0001s（0.1ms），推导过程中也有笔误。按代入的 0.1ms 计算，结论「队列容量为 7」是对的；
+    如果真是 1ms，L = 100，队列需要 97。关键记住：<strong>队列越大，工作穿过系统的时间就越长 —— 你是在用延迟换取系统利用率。</strong>
+  </p>
+</div>
+
+<p>
+  利特尔法则无法告诉你的是<strong>故障处理</strong>：如果管道因为某种原因 panic，队列里的所有请求都会丢失。如果重建请求很困难，可以把队列大小设为 0，
+  或者改用<strong>持久化队列</strong>（把队列保存在某处，需要时再读回来）。
+</p>
+
+<div class="box key">
+  <div class="t">&#9733; 小结：队列</div>
+  <p>队列在系统中可能有用，但因为复杂，它通常是作者最后才建议实施的优化之一。放在入口、或放在批处理能带来收益的地方；用利特尔法则估算大小；别指望它缩短总时间。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="context">context 包</h2>
+
+<p>
+  并发程序里，经常因为超时、取消或系统其他部分出错而需要抢占操作。我们已经用过 done 通道：它流经整个程序，取消所有阻塞的并发操作。效果不错，但能力有限。
+  如果能在「取消」这个简单通知之外附带更多信息就好了：<strong>为什么取消？</strong>函数有没有一个必须完成的<strong>截止时间</strong>？
+</p>
+
+<p>
+  在任何规模的系统里，给 done 通道包上这些信息的需求都很普遍，于是 Go 作者决定为此建立一个标准模式。它最初是标准库之外的实验，
+  <strong>Go 1.7 把 <code>context</code> 包纳入了标准库</strong>，从此成为编写并发代码时要考虑的标准 Go 惯用法。它的 API 很小：
+</p>
+
+<div class="code" data-lang="go" data-file="context 包概览（Go 1.7–1.19）">
+<pre>
+var Canceled = errors.New("context canceled")
+var DeadlineExceeded error = deadlineExceededError{}
+
+type CancelFunc
+type Context
+
+func Background() Context
+func TODO() Context
+func WithCancel(parent Context) (ctx Context, cancel CancelFunc)
+func WithDeadline(parent Context, deadline time.Time) (Context, CancelFunc)
+func WithTimeout(parent Context, timeout time.Duration) (Context, CancelFunc)
+func WithValue(parent Context, key, val interface{}) Context
+</pre>
+</div>
+
+<p><code>Context</code> 是会像 done 通道一样流经系统的类型。使用 context 时，顶层并发调用下游的每个函数都把 <code>Context</code> 作为<strong>第一个参数</strong>：</p>
+
+<div class="code" data-lang="go">
+<pre>
+type Context interface {
+	// Deadline 返回代表这个 context 的工作应该被取消的时间。
+	// 没有设置截止时间时 ok 为 false。
+	Deadline() (deadline time.Time, ok bool)
+
+	// Done 返回一个通道，当代表这个 context 的工作应该被取消时关闭。
+	// 如果这个 context 永远不会被取消，可能返回 nil。
+	Done() &lt;-chan struct{}
+
+	// Done 关闭后，Err 返回非 nil 的错误：
+	// 被取消返回 Canceled，超过截止时间返回 DeadlineExceeded。
+	Err() error
+
+	// Value 返回与 key 关联的值，没有则返回 nil。
+	Value(key interface{}) interface{}
+}
+</pre>
+</div>
+
+<p>
+  <code>Done</code> 返回一个在函数应被抢占时关闭的通道；<code>Deadline</code> 说明 goroutine 是否会在某个时间后被取消；<code>Err</code> 在被取消后返回非 nil。
+  <code>Value</code> 看起来有点格格不入：Go 作者注意到 goroutine 的一大用途是服务请求，而这类程序通常除了抢占信息，还要传递<strong>请求相关的信息</strong>。所以 context 包有两个主要用途：
+</p>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#9986;</span><h4>取消</h4><p>提供一个 API，用来取消调用图中的分支。</p></div>
+  <div class="card"><span class="ic">&#128188;</span><h4>数据袋</h4><p>提供一个在调用图中传递<strong>请求作用域数据</strong>的「数据袋」。</p></div>
+</div>
+
+<h3 id="ctx-cancel">取消</h3>
+
+<p>回顾「防止 goroutine 泄漏」，函数中的取消有三个方面：</p>
+<ul>
+  <li>goroutine 的父亲可能想取消它；</li>
+  <li>goroutine 可能想取消它的孩子；</li>
+  <li>goroutine 里的任何阻塞操作都需要可抢占，以便能被取消。</li>
+</ul>
+
+<p>
+  context 包帮你管理这三点。注意 <code>Context</code> 接口里<strong>没有任何能修改底层状态的方法</strong>，接收 <code>Context</code> 的函数也没法取消它 ——
+  这保护了调用栈上层的函数不被孩子取消。配合提供 done 通道的 <code>Done</code> 方法，<code>Context</code> 能安全地管理来自祖先的取消。
+</p>
+
+<p>那么问题来了：既然 <code>Context</code> 不可变，怎样影响当前函数以下的调用栈的取消行为？这就是这几个函数的作用：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="context 派生树：父 context 取消会传播到所有子孙，子 context 取消不影响父亲">
+  <rect class="bx" x="300" y="16" width="160" height="40" rx="10"/>
+  <text class="mono" x="380" y="41" text-anchor="middle">Background()</text>
+  <path class="ln" d="M380 58 V82"/>
+  <rect class="bx-a" x="290" y="84" width="180" height="44" rx="10"/>
+  <text class="mono on-a" x="380" y="104" text-anchor="middle">WithCancel</text>
+  <text class="sm" x="380" y="120" text-anchor="middle">main 持有 cancel()</text>
+  <path class="ln" d="M330 130 L190 168 M430 130 L570 168"/>
+  <rect class="bx-p" x="80" y="170" width="220" height="44" rx="10"/>
+  <text class="mono on-p" x="190" y="190" text-anchor="middle">WithTimeout(1s)</text>
+  <text class="sm" x="190" y="206" text-anchor="middle">genGreeting 自己加的超时</text>
+  <rect class="bx" x="460" y="170" width="220" height="44" rx="10"/>
+  <text class="mono" x="570" y="190" text-anchor="middle">（原样传递）</text>
+  <text class="sm" x="570" y="206" text-anchor="middle">genFarewell 不改取消行为</text>
+  <path class="ln" d="M190 216 V240"/><path class="ln" d="M570 216 V240"/>
+  <rect class="bx" x="120" y="242" width="140" height="34" rx="8"/><text class="mono" x="190" y="264" text-anchor="middle">locale(ctx)</text>
+  <rect class="bx" x="500" y="242" width="140" height="34" rx="8"/><text class="mono" x="570" y="264" text-anchor="middle">locale(ctx)</text>
+  <path class="ln-r" style="stroke-dasharray:4 4" d="M480 100 C 640 100, 700 150, 690 236" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="612" y="70">父取消 → 所有子孙取消</text>
+  <path class="ln-g" style="stroke-dasharray:4 4" d="M78 192 C 30 160, 40 110, 286 104" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="20" y="62">子超时不影响父亲</text>
+  <text class="sm on-g" x="20" y="78">（除非父亲自己决定）</text>
+</svg>
+<figcaption>图 4-14　context 是一棵树：取消只会向下传播</figcaption>
+</figure>
+
+<ul>
+  <li><code>WithCancel</code> 返回一个新 <code>Context</code>，调用返回的 <code>cancel</code> 函数时，它的 done 通道关闭；</li>
+  <li><code>WithDeadline</code> 返回的 <code>Context</code> 在机器时钟越过截止时间时关闭 done 通道；</li>
+  <li><code>WithTimeout</code> 返回的 <code>Context</code> 在给定时长后关闭 done 通道。</li>
+</ul>
+
+<p>
+  如果你的函数需要以某种方式取消它下面的调用，就用它收到的 <code>Context</code> 调用这些函数，再把返回的新 <code>Context</code> 传给孩子；如果不需要修改取消行为，就原样传递。
+  这样调用图的每一层都可以创建符合自己需要的 <code>Context</code>，而不影响父亲。这是管理调用图分支的一种非常可组合、优雅的方案。
+</p>
+
+<div class="box warn">
+  <div class="t">&#9888; 不要把 Context 存在结构体里</div>
+  <p>
+    面向对象的习惯是把常用数据存成成员变量，但<strong>不要这样对待 <code>context.Context</code></strong>。从外面看各个 Context 实例差不多，但它们在每一层栈帧都可能变化。
+    所以一定要把 Context 作为参数传进函数，确保函数拿到的是给它的那个 Context，而不是给 N 层之上的栈帧的那个。
+  </p>
+</div>
+
+<p>
+  在异步调用图的顶端，你的代码多半没有收到 Context。为了开始这条链，context 包提供了两个创建空 <code>Context</code> 的函数：
+  <code>Background()</code> 返回一个空 Context；<code>TODO()</code> 也返回空 Context，但它的用途是占位：当你不知道该用哪个 Context，或者预计上游将来会提供、但目前还没有时使用，不应出现在生产代码里。
+</p>
+
+<h3 id="ctx-example">示例：从 done 通道迁移到 context</h3>
+
+<p>下面这个程序并发地打印问候语和告别语，使用 done 通道模式：</p>
+
+<div class="code" data-lang="go" data-file="the-context-package/fig-greeter-with-done-chan.go">
+<pre>
+func main() {
+	var wg sync.WaitGroup
+	done := make(chan interface{})
+	defer close(done)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := printGreeting(done); err != nil {
+			fmt.Printf("%v", err)
+			return
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := printFarewell(done); err != nil {
+			fmt.Printf("%v", err)
+			return
+		}
+	}()
+
+	wg.Wait()
+}
+
+func printGreeting(done &lt;-chan interface{}) error {
+	greeting, err := genGreeting(done)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s world!\n", greeting)
+	return nil
+}
+
+func printFarewell(done &lt;-chan interface{}) error {
+	farewell, err := genFarewell(done)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s world!\n", farewell)
+	return nil
+}
+
+func genGreeting(done &lt;-chan interface{}) (string, error) {
+	switch locale, err := locale(done); {
+	case err != nil:
+		return "", err
+	case locale == "EN/US":
+		return "hello", nil
+	}
+	return "", fmt.Errorf("unsupported locale")
+}
+
+func genFarewell(done &lt;-chan interface{}) (string, error) {
+	switch locale, err := locale(done); {
+	case err != nil:
+		return "", err
+	case locale == "EN/US":
+		return "goodbye", nil
+	}
+	return "", fmt.Errorf("unsupported locale")
+}
+
+func locale(done &lt;-chan interface{}) (string, error) {
+	select {
+	case &lt;-done:
+		return "", fmt.Errorf("canceled")
+	case &lt;-time.After(1 * time.Minute): // 模拟一个很慢的操作
+	}
+	return "EN/US", nil
+}
+</pre>
+</div>
+
+<p>
+  输出 <code>goodbye world!</code> 和 <code>hello world!</code>（忽略竞态：可能先说再见再打招呼）。现在我们想做两件事：
+  ① <code>genGreeting</code> 只愿意等 <code>locale</code> 1 秒；② 如果 <code>printGreeting</code> 失败，就取消 <code>printFarewell</code> —— 没打招呼就说再见不合理。用 context 实现非常简单：
+</p>
+
+<div class="code" data-lang="go" data-file="the-context-package/fig-greeter-with-context.go">
+<pre>
+func main() {
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background()) // ① 从 Background 派生一个可取消的 Context
+	defer cancel()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := printGreeting(ctx); err != nil {
+			fmt.Printf("cannot print greeting: %v\n", err)
+			cancel() // ② 打招呼失败，取消整个 Context
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := printFarewell(ctx); err != nil {
+			fmt.Printf("cannot print farewell: %v\n", err)
+		}
+	}()
+
+	wg.Wait()
+}
+
+func printGreeting(ctx context.Context) error {
+	greeting, err := genGreeting(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s world!\n", greeting)
+	return nil
+}
+
+func printFarewell(ctx context.Context) error {
+	farewell, err := genFarewell(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s world!\n", farewell)
+	return nil
+}
+
+func genGreeting(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Second) // ③ 1 秒后自动取消，影响它传下去的 locale
+	defer cancel()
+
+	switch locale, err := locale(ctx); {
+	case err != nil:
+		return "", err
+	case locale == "EN/US":
+		return "hello", nil
+	}
+	return "", fmt.Errorf("unsupported locale")
+}
+
+func genFarewell(ctx context.Context) (string, error) {
+	switch locale, err := locale(ctx); {
+	case err != nil:
+		return "", err
+	case locale == "EN/US":
+		return "goodbye", nil
+	}
+	return "", fmt.Errorf("unsupported locale")
+}
+
+func locale(ctx context.Context) (string, error) {
+	select {
+	case &lt;-ctx.Done():
+		return "", ctx.Err() // ④ 返回取消的原因，这个错误会一路冒泡到 main，触发 ②
+	case &lt;-time.After(1 * time.Minute):
+	}
+	return "EN/US", nil
+}
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+cannot print greeting: context deadline exceeded
+cannot print farewell: context canceled
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 304" role="img" aria-label="context 版问候程序的调用图与取消传播顺序">
+  <rect class="bx-a" x="310" y="16" width="140" height="40" rx="10"/><text class="mono on-a" x="380" y="41" text-anchor="middle">main ①</text>
+  <rect class="bx" x="120" y="90" width="180" height="40" rx="10"/><text class="mono" x="210" y="115" text-anchor="middle">printGreeting</text>
+  <rect class="bx" x="460" y="90" width="180" height="40" rx="10"/><text class="mono" x="550" y="115" text-anchor="middle">printFarewell</text>
+  <rect class="bx-p" x="120" y="164" width="180" height="40" rx="10"/><text class="mono on-p" x="210" y="189" text-anchor="middle">genGreeting ③ 1s</text>
+  <rect class="bx" x="460" y="164" width="180" height="40" rx="10"/><text class="mono" x="550" y="189" text-anchor="middle">genFarewell</text>
+  <rect class="bx-r" x="120" y="238" width="180" height="40" rx="10"/><text class="mono on-r" x="210" y="263" text-anchor="middle">locale ④</text>
+  <rect class="bx-r" x="460" y="238" width="180" height="40" rx="10"/><text class="mono on-r" x="550" y="263" text-anchor="middle">locale</text>
+  <path class="ln" d="M350 58 L230 88 M410 58 L530 88 M210 132 V162 M550 132 V162 M210 206 V236 M550 206 V236"/>
+  <!-- 编号步骤 -->
+  <text class="sm on-r" x="6" y="262">1s 到期 →</text>
+  <text class="sm on-r" x="6" y="278">Deadline-</text>
+  <text class="sm on-r" x="6" y="294">Exceeded</text>
+  <path class="ln-r" d="M114 244 C 90 200, 90 140, 116 116" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="14" y="182">错误一路冒泡</text>
+  <path class="ln-r" d="M120 96 C 150 40, 220 30, 306 34" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="20" y="60">② cancel()</text>
+  <path class="ln-r" style="stroke-dasharray:4 4" d="M454 36 C 690 40, 700 200, 644 252" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="380" y="150" text-anchor="middle">取消向下传播</text>
+  <text class="sm on-r" x="380" y="166" text-anchor="middle">→ context canceled</text>
+</svg>
+<figcaption>图 4-15　超时在左边分支产生，cancel 让右边分支也停下</figcaption>
+</figure>
+
+<p>
+  注意 <code>genGreeting</code> 构建了满足自己需要的 <code>Context</code>，却不必影响父亲的 <code>Context</code>。
+  如果 <code>genGreeting</code> 成功返回、<code>printGreeting</code> 还需要再调用别的函数，它可以这样做，而不会泄漏 <code>genGreeting</code> 的工作方式。这种可组合性让你能写大型系统，而不会把关注点混在整个调用图里。
+</p>
+
+<p>还可以再改进：既然知道 <code>locale</code> 大约需要 1 分钟，它可以检查自己是否被给了截止时间、能否赶得上，赶不上就<strong>快速失败</strong>：</p>
+
+<div class="code" data-lang="go">
+<pre>
+func locale(ctx context.Context) (string, error) {
+	if deadline, ok := ctx.Deadline(); ok { // ① 有截止时间吗？
+		if deadline.Sub(time.Now().Add(1*time.Minute)) &lt;= 0 {
+			return "", context.DeadlineExceeded // 肯定赶不上，直接失败，不必傻等
+		}
+	}
+
+	select {
+	case &lt;-ctx.Done():
+		return "", ctx.Err()
+	case &lt;-time.After(1 * time.Minute):
+	}
+	return "EN/US", nil
+}
+</pre>
+</div>
+
+<p>
+  改动很小，但能让 <code>locale</code> 立即失败，而不是等到真正超时。在调用代价高的程序里，这能省下大量时间。唯一的难处是：你得大致知道下游调用图要花多久，这可能很难估计。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：context 包的新成员 <span class="ver">Go 1.20</span><span class="ver">Go 1.21</span></div>
+  <div class="tw">
+  <table>
+    <tr><th>API</th><th>版本</th><th>用途</th></tr>
+    <tr><td><code>WithCancelCause</code> / <code>Cause</code></td><td>1.20</td><td>取消时附带具体原因：<code>cancel(err)</code>，之后 <code>context.Cause(ctx)</code> 取回。弥补了 <code>Err()</code> 只能返回 Canceled/DeadlineExceeded 的不足</td></tr>
+    <tr><td><code>WithDeadlineCause</code> / <code>WithTimeoutCause</code></td><td>1.21</td><td>超时时也能指定原因</td></tr>
+    <tr><td><code>AfterFunc</code></td><td>1.21</td><td>context 结束时在新 goroutine 里调用一个函数，可用于联动取消、唤醒 Cond、关闭连接等</td></tr>
+    <tr><td><code>WithoutCancel</code></td><td>1.21</td><td>得到一个保留 Value、但不随父亲取消的 context（比如请求结束后还要异步写审计日志）</td></tr>
+    <tr><td><code>testing.T.Context()</code></td><td>1.24</td><td>测试专用 context，在测试结束、Cleanup 之前自动取消</td></tr>
+  </table>
+  </div>
+  <p>另外，<code>go vet</code> 的 <code>lostcancel</code> 检查会提醒你忘了调用 <code>WithCancel/WithTimeout</code> 返回的 <code>cancel</code>（会泄漏资源）；上面「快速失败」的判断用 <code>time.Until(deadline) &lt; time.Minute</code> 写会更直观。</p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="新写法：带原因的取消">
+<pre>
+ctx, cancel := context.WithCancelCause(context.Background())
+defer cancel(nil)
+
+go func() {
+	if err := printGreeting(ctx); err != nil {
+		cancel(fmt.Errorf("greeting failed: %w", err)) // 记下真正的原因
+	}
+}()
+// ……别处：
+&lt;-ctx.Done()
+fmt.Println(ctx.Err())          // context canceled
+fmt.Println(context.Cause(ctx)) // greeting failed: context deadline exceeded
+</pre>
+  </div>
+</div>
+
+<h3 id="ctx-value">数据袋：请求作用域的数据</h3>
+
+<p>
+  context 的另一半功能，是存取请求作用域数据的数据袋。函数创建 goroutine 和 Context 时，往往是在启动一个服务请求的过程，栈深处的函数可能需要请求的信息：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+func main() {
+	ProcessRequest("jane", "abc123")
+}
+
+func ProcessRequest(userID, authToken string) {
+	ctx := context.WithValue(context.Background(), "userID", userID)
+	ctx = context.WithValue(ctx, "authToken", authToken)
+	HandleResponse(ctx)
+}
+
+func HandleResponse(ctx context.Context) {
+	fmt.Printf(
+		"handling response for %v (%v)",
+		ctx.Value("userID"),
+		ctx.Value("authToken"),
+	) // handling response for jane (abc123)
+}
+</pre>
+</div>
+
+<p>要求只有两点：</p>
+<ul>
+  <li>键必须满足 Go 的<strong>可比较性</strong>（<code>==</code> 和 <code>!=</code> 能给出正确结果）；</li>
+  <li>返回的值必须能被多个 goroutine 安全地访问。</li>
+</ul>
+
+<p>
+  键和值都是 <code>interface{}</code>，取值时就失去了类型安全：键可能类型不对或略有不同，值也可能不是你期望的类型。所以 Go 作者建议：
+  <strong>在你的包里定义一个自定义（不导出）的键类型</strong>。只要别的包也这么做，就不会冲突。看看为什么：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+type foo int
+type bar int
+
+m := make(map[interface{}]int)
+m[foo(1)] = 1
+m[bar(1)] = 2
+
+fmt.Printf("%v", m) // map[1:1 1:2]：底层值都是 1，但类型不同，所以是两个键
+</pre>
+</div>
+
+<p>键的类型不导出，其他包就没法构造出和你冲突的键。既然键不导出，就需要导出取值函数 —— 正好可以让使用者通过静态、类型安全的函数来取数据：</p>
+
+<div class="code" data-lang="go">
+<pre>
+type ctxKey int
+
+const (
+	ctxUserID ctxKey = iota
+	ctxAuthToken
+)
+
+func UserID(c context.Context) string {
+	return c.Value(ctxUserID).(string)
+}
+
+func AuthToken(c context.Context) string {
+	return c.Value(ctxAuthToken).(string)
+}
+
+func ProcessRequest(userID, authToken string) {
+	ctx := context.WithValue(context.Background(), ctxUserID, userID)
+	ctx = context.WithValue(ctx, ctxAuthToken, authToken)
+	HandleResponse(ctx)
+}
+
+func HandleResponse(ctx context.Context) {
+	fmt.Printf(
+		"handling response for %v (auth: %v)",
+		UserID(ctx),
+		AuthToken(ctx),
+	) // handling response for jane (auth: abc123)
+}
+</pre>
+</div>
+
+<p>
+  不过这个技巧也带来一个问题：假设 <code>HandleResponse</code> 在 <code>response</code> 包、<code>ProcessRequest</code> 在 <code>process</code> 包。
+  <code>process</code> 要导入 <code>response</code> 才能调用 <code>HandleResponse</code>，而 <code>HandleResponse</code> 要用 <code>process</code> 里的取值函数就得导入 <code>process</code> —— 循环依赖！
+  这会迫使你的架构把数据类型集中到一个被多处导入的包里。这不一定是坏事，但要心里有数。
+</p>
+
+<h3 id="ctx-heuristics">什么数据该放进 context？</h3>
+
+<p>
+  context 包在 Go 社区里颇有争议：取消功能广受好评，但「能往 Context 里存任意数据、而且是类型不安全地存」引起了分歧。更大的问题是：<strong>到底该存什么？</strong>
+  context 包的注释给出的指引有点模糊：
+</p>
+
+<blockquote style="margin:16px 0;padding:10px 18px;border-left:3px solid var(--line-2);color:var(--fg-soft)">
+  context 值只用于传递<strong>跨越进程和 API 边界的请求作用域数据</strong>，不要用来给函数传递可选参数。
+</blockquote>
+
+<p>「可选参数」很好理解（别用 Context 满足你对可选参数的隐秘渴望），但什么是「请求作用域数据」？作者给出了自己的五条启发式规则：</p>
+
+<ol>
+  <li><strong>数据应该跨越进程或 API 边界。</strong>如果数据是在进程内存里生成的，除非也要跨 API 边界传递，否则多半不适合。</li>
+  <li><strong>数据应该是不可变的。</strong>如果不是，按定义它就不是来自请求的。</li>
+  <li><strong>数据应该趋向于简单类型。</strong>既然要跨越进程和 API 边界，对方取数据时最好不必再导入一大堆包。</li>
+  <li><strong>数据应该是数据，而不是带方法的类型。</strong>操作是逻辑，属于消费数据的那一方。</li>
+  <li><strong>数据应该用来修饰操作，而不是驱动操作。</strong>如果你的算法会因 Context 里有没有某个值而表现不同，你多半已经越界到「可选参数」了。</li>
+</ol>
+
+<div class="tw">
+<table>
+  <tr><th>数据</th><th>1 跨边界</th><th>2 不可变</th><th>3 简单类型</th><th>4 是数据</th><th>5 只修饰</th></tr>
+  <tr><td>请求 ID</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+  <tr><td>用户 ID</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+  <tr><td>URL</td><td>✓</td><td>✓</td><td></td><td></td><td></td></tr>
+  <tr><td>API 服务器连接</td><td></td><td></td><td></td><td></td><td></td></tr>
+  <tr><td>授权令牌</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td></td></tr>
+  <tr><td>请求令牌</td><td>✓</td><td>✓</td><td>✓</td><td></td><td></td></tr>
+</table>
+</div>
+
+<p>
+  （作者的观点，你同意吗？）有些情况很明确，比如 API 服务器连接显然不该放进 context；有些就没那么清楚：授权令牌不可变、多半是字节切片，可接收方难道不会根据它决定是否处理请求吗？
+  再者，一个团队能接受的，另一个团队未必能接受。另一个维度是数据在被使用前要穿过多少层：如果中间隔着几个框架、几十个函数，你更想要冗长但自我描述的函数签名，还是放进 Context 制造一个隐形依赖？各有利弊，最终要和团队一起决定。
+</p>
+
+<div class="box key">
+  <div class="t">&#9733; 作者的最后建议</div>
+  <p>Context 提供的<strong>取消功能非常有用</strong>，不要因为对数据袋的看法而放弃使用它。</p>
+</div>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：今天的共识</div>
+  <ul>
+    <li>用 context 传「请求 ID、追踪 span、认证后的用户身份」等跨切面数据已是主流做法（OpenTelemetry、<code>log/slog</code> 的 <code>InfoContext</code> 都基于此）。</li>
+    <li>键用不导出的类型（如 <code>type ctxKey struct{}</code>），并提供 <code>FromContext/NewContext</code> 风格的导出函数。staticcheck 的 SA1029 会对「用内建类型如 string 当键」报警。</li>
+    <li>取值时用 <code>v, ok := ctx.Value(key).(T)</code> 的双返回值形式，避免值不存在时 panic（书中的 <code>UserID</code> 在没有值时会 panic）。</li>
+    <li>标准库几乎所有可能阻塞的 API 都有接受 context 的版本：<code>http.NewRequestWithContext</code>、<code>db.QueryContext</code>、<code>net.Dialer.DialContext</code>、<code>exec.CommandContext</code>……</li>
+  </ul>
+</div>
+
+<h2 id="summary">本章小结</h2>
+
+<div class="tw">
+<table>
+  <tr><th>模式</th><th>解决什么问题</th></tr>
+  <tr><td>约束</td><td>让数据只能被一个 goroutine 访问，从而不需要同步</td></tr>
+  <tr><td>for-select</td><td>在循环中等待多个事件 / 定期检查是否该停止</td></tr>
+  <tr><td>done 通道</td><td>父 goroutine 通知子 goroutine 停止，防止泄漏</td></tr>
+  <tr><td>or-channel</td><td>多个 done 合成一个，任一关闭即关闭</td></tr>
+  <tr><td>Result 类型</td><td>把错误和结果一起送回有上下文的一方</td></tr>
+  <tr><td>管道 / 生成器</td><td>把处理拆成可组合、可并发、可取消的阶段</td></tr>
+  <tr><td>扇出扇入</td><td>并行化顺序无关、耗时长的阶段</td></tr>
+  <tr><td>or-done</td><td>让「range 一个外部通道」也能被取消</td></tr>
+  <tr><td>tee</td><td>一个流复制成两个</td></tr>
+  <tr><td>bridge</td><td>把通道的序列拍平成一个流</td></tr>
+  <tr><td>队列</td><td>解耦阶段；只放在入口或批处理处；用利特尔法则估算</td></tr>
+  <tr><td>context</td><td>标准化的取消、超时、截止时间与请求作用域数据</td></tr>
+</table>
+</div>
+
+<div class="exercise">
+  <h3>&#9998; 动手练习</h3>
+  <ol>
+    <li>运行 <code>fig-leak-from-blocked-channel-write.go</code>，在程序末尾加 <code>time.Sleep</code> 和 <code>runtime.NumGoroutine()</code> 打印，确认泄漏；再改成带 done 的版本对比。</li>
+    <li>用本章的泛型工具箱实现：读取一个文本文件的所有行（生成器）→ 扇出 4 个 goroutine 统计每行的单词数 → 扇入 → 求和。</li>
+    <li>修改 <code>tee</code>：如果其中一个输出没人读，会发生什么？加一个测试证明你的判断。</li>
+    <li>把 <code>fig-greeter-with-context.go</code> 改用 <code>WithCancelCause</code>，让 farewell 的错误信息能说明「因为 greeting 失败」。</li>
+    <li>用利特尔法则估算：一个 3 阶段管道，每个请求停留 20ms，要支撑 2000 QPS，系统中平均有多少个请求？队列至少要多大？</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

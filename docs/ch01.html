@@ -1,0 +1,953 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 1 章 · 并发编程导论 — Go 并发编程图解笔记</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="1">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 1 章</span>
+<h1>并发编程导论</h1>
+<p class="lede">
+  「并发」这个词，不同的人理解不一样。这一章先给它一个实用的定义，
+  然后回答两个问题：为什么现代软件绕不开并发？为什么并发代码这么难写对？
+  我们会认识并发世界里的「五大恶人」—— 竞态、原子性破坏、死锁、活锁和饥饿。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解摩尔定律放缓、阿姆达尔定律和云计算如何把并发推到每个程序员面前</li>
+    <li>分清「竞态条件」和「数据竞争」，知道为什么 <code>time.Sleep</code> 不是解药</li>
+    <li>理解原子性取决于「上下文」，以及 <code>i++</code> 为什么不是原子的</li>
+    <li>认识临界区、死锁的四个科夫曼条件、活锁与饥饿</li>
+    <li>学会用注释和函数签名把「并发约定」告诉调用者</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="what">先给「并发」下个定义</h2>
+
+<p>
+  你可能还听过「异步」「并行」「多线程」这些词。有人把它们混着用，有人分得很细。第 2 章会专门讨论并发的哲学，
+  这里先用一个够用的定义：
+</p>
+
+<div class="box key">
+  <div class="t">&#9733; 实用定义</div>
+  <p>当我们说两件事「并发」时，指的是它们<strong>在同一段时间里都在推进</strong>。你正在读这句话，世界上其他人也在各自生活 —— 你们是「并发」的。</p>
+</div>
+
+<p>
+  并发是计算机科学里一个很大的话题，从理论建模、正确性证明到工程实践都有。本书只关注实际问题：
+  <strong>Go 怎样为并发建模、这个模型会带来什么问题、以及怎样组合 Go 的原语来解决问题。</strong>
+</p>
+
+<h2 id="history">摩尔定律、Web 规模，以及我们面临的困境</h2>
+
+<p>
+  1965 年，戈登·摩尔预测集成电路上的元件数每年翻一番（1975 年修正为每两年）。这个预测大体上一直成立到 2012 年前后。
+  当单核性能越来越难提升，芯片厂商转向了另一条路：<strong>多核处理器</strong>。
+</p>
+
+<p>
+  多核看起来绕开了摩尔定律的瓶颈，但很快大家撞上了另一条定律 —— <strong>阿姆达尔定律（Amdahl's law）</strong>：
+  并行化能带来的提升，受限于程序中<strong>必须顺序执行</strong>的那一部分。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="阿姆达尔定律：可并行比例不同的程序，加速比随核数变化的曲线">
+  <!-- 坐标轴 -->
+  <path class="ln" d="M80 260 H530"/>
+  <path class="ln" d="M80 260 V30"/>
+  <!-- 网格 -->
+  <path class="ln-d" d="M80 205 H520 M80 150 H520 M80 95 H520 M80 40 H520" style="opacity:.5"/>
+  <text class="sm" x="70" y="264" text-anchor="end">0</text>
+  <text class="sm" x="70" y="209" text-anchor="end">4</text>
+  <text class="sm" x="70" y="154" text-anchor="end">8</text>
+  <text class="sm" x="70" y="99"  text-anchor="end">12</text>
+  <text class="sm" x="70" y="44"  text-anchor="end">16</text>
+  <text class="lbl" x="22" y="150" transform="rotate(-90 22 150)" text-anchor="middle">加速比（倍）</text>
+  <text class="sm" x="80"  y="278" text-anchor="middle">1</text>
+  <text class="sm" x="153" y="278" text-anchor="middle">2</text>
+  <text class="sm" x="227" y="278" text-anchor="middle">4</text>
+  <text class="sm" x="300" y="278" text-anchor="middle">8</text>
+  <text class="sm" x="373" y="278" text-anchor="middle">16</text>
+  <text class="sm" x="447" y="278" text-anchor="middle">32</text>
+  <text class="sm" x="520" y="278" text-anchor="middle">64</text>
+  <text class="lbl" x="300" y="296" text-anchor="middle">CPU 核数</text>
+
+  <path class="ln-a" stroke-linejoin="round" d="M80 246.2 L109 242.1 L139 236.9 L168 230.3 L197 222.2 L227 212.2 L256 200.2 L285 186.2 L315 170.4 L344 152.9 L373 134.3 L403 115.3 L432 96.5 L461 78.7 L491 62.4 L520 48.0"/>
+  <path class="ln-p" stroke-linejoin="round" d="M80 246.2 L109 242.4 L139 237.7 L168 232.0 L197 225.4 L227 217.7 L256 209.2 L285 200.0 L315 190.5 L344 181.1 L373 172.0 L403 163.6 L432 156.1 L461 149.5 L491 144.0 L520 139.5"/>
+  <path class="ln-b" stroke-linejoin="round" d="M80 246.2 L109 243.2 L139 239.8 L168 236.1 L197 232.4 L227 228.6 L256 224.9 L285 221.6 L315 218.5 L344 215.9 L373 213.7 L403 211.8 L432 210.3 L461 209.2 L491 208.2 L520 207.5"/>
+  <path class="ln-g" stroke-linejoin="round" d="M80 246.2 L109 244.4 L139 242.5 L168 240.8 L197 239.3 L227 238.0 L256 236.9 L285 236.0 L315 235.2 L344 234.6 L373 234.1 L403 233.7 L432 233.5 L461 233.2 L491 233.1 L520 232.9"/>
+
+  <text class="sm on-a" x="526" y="52">15.4×</text>
+  <text class="sm on-p" x="526" y="143">8.8×</text>
+  <text class="sm on-b" x="526" y="211">3.8×</text>
+  <text class="sm on-g" x="526" y="236">2.0×</text>
+
+  <!-- 图例 -->
+  <rect class="bx" x="580" y="40" width="165" height="150" rx="8"/>
+  <text class="ttl" x="596" y="64">可并行部分 p</text>
+  <path class="ln-a" d="M596 88 H626"/><text class="lbl" x="634" y="92">p = 95%</text>
+  <path class="ln-p" d="M596 114 H626"/><text class="lbl" x="634" y="118">p = 90%</text>
+  <path class="ln-b" d="M596 140 H626"/><text class="lbl" x="634" y="144">p = 75%</text>
+  <path class="ln-g" d="M596 166 H626"/><text class="lbl" x="634" y="170">p = 50%</text>
+  <text class="mono" x="662" y="222" text-anchor="middle">S(n) = 1 / ((1−p) + p/n)</text>
+  <text class="sm" x="662" y="242" text-anchor="middle">n 为核数，S 为加速比</text>
+</svg>
+<figcaption>图 1-1　阿姆达尔定律：哪怕只有一半代码必须顺序执行，64 个核也只能带来 2 倍提升</figcaption>
+</figure>
+
+<p>书里举了两个极端的例子：</p>
+<ul>
+  <li><strong>图形界面程序</strong>：用户点按钮、程序做事。整个流程被一个巨大的顺序部分卡住 —— <em>人的操作速度</em>。给它再多核也没用。</li>
+  <li><strong>计算圆周率的各位数字</strong>：借助「龙头算法（spigot algorithm）」，这个问题可以被切成互不相干的小块，
+    属于<strong>「易并行」（embarrassingly parallel）</strong>问题。核越多越快，新的难题变成怎样合并和存储结果。</li>
+</ul>
+
+<p>
+  对于易并行的问题，推荐把程序写成可以<strong>水平扩展</strong>的：多开几个实例、多用几台机器，系统就变快。
+  2000 年代兴起的<strong>云计算</strong>让水平扩展变得廉价，也催生了「Web 规模（web scale）」软件 ——
+  通过增加实例来应对几十万并发请求，支持滚动升级、弹性伸缩和异地部署。
+</p>
+
+<p>
+  但代价是复杂度。2005 年 Herb Sutter 写了一篇著名文章《免费的午餐结束了》（<em>The free lunch is over</em>），
+  他说：「我们迫切需要一种比现有语言更高层次的并发编程模型。」要理解他为什么用这么重的语气，就得看看并发到底难在哪。
+</p>
+
+<h2 id="hard">为什么并发很难？</h2>
+
+<p>
+  并发代码出了名地难写对。常常要改好几轮才能按预期工作，甚至上线几年后，因为磁盘变忙、用户变多这样的<strong>时序变化</strong>，
+  一个潜伏已久的 bug 才突然冒出来。好消息是：大家踩的坑都差不多，计算机科学家已经给它们起好了名字。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 150" role="img" aria-label="并发编程中的五类常见问题">
+  <rect class="bx-r" x="10"  y="20" width="138" height="70" rx="10"/>
+  <text class="ttl on-r" x="79" y="48" text-anchor="middle">竞态条件</text>
+  <text class="sm" x="79" y="70" text-anchor="middle">顺序没有保证</text>
+  <rect class="bx-a" x="160" y="20" width="138" height="70" rx="10"/>
+  <text class="ttl on-a" x="229" y="48" text-anchor="middle">原子性</text>
+  <text class="sm" x="229" y="70" text-anchor="middle">操作被打断</text>
+  <rect class="bx-p" x="310" y="20" width="138" height="70" rx="10"/>
+  <text class="ttl on-p" x="379" y="48" text-anchor="middle">死锁</text>
+  <text class="sm" x="379" y="70" text-anchor="middle">大家互相等</text>
+  <rect class="bx-b" x="460" y="20" width="138" height="70" rx="10"/>
+  <text class="ttl on-b" x="529" y="48" text-anchor="middle">活锁</text>
+  <text class="sm" x="529" y="70" text-anchor="middle">很忙但没进展</text>
+  <rect class="bx-g" x="610" y="20" width="138" height="70" rx="10"/>
+  <text class="ttl on-g" x="679" y="48" text-anchor="middle">饥饿</text>
+  <text class="sm" x="679" y="70" text-anchor="middle">资源被别人霸占</text>
+  <path class="ln-d" d="M10 112 H298"/>
+  <text class="lbl" x="154" y="132" text-anchor="middle">正确性问题：答案可能是错的</text>
+  <path class="ln-d" d="M310 112 H748"/>
+  <text class="lbl" x="529" y="132" text-anchor="middle">活性问题：程序可能不再做有用的事</text>
+</svg>
+<figcaption>图 1-2　本章要认识的五类问题，分成「正确性」和「活性」两组</figcaption>
+</figure>
+
+<h3 id="race">竞态条件（Race Condition）</h3>
+
+<p>
+  <strong>竞态条件</strong>：两个或多个操作<em>必须</em>按正确的顺序执行，但程序没有写成能保证这个顺序。
+  它最常见的表现形式是<strong>数据竞争（data race）</strong>：一个并发操作在读某个变量，而另一个并发操作在不确定的时刻写同一个变量。
+</p>
+
+<div class="code" data-lang="go" data-file="race-conditions/fig-basic-race-condition.go">
+<pre>
+var data int
+go func() { // 用 go 关键字启动一个 goroutine，和下面的代码并发执行
+	data++     // 第 3 行：写
+}()
+if data == 0 { // 第 5 行：读
+	fmt.Printf("the value is %v.\n", data) // 第 6 行：再读
+}
+</pre>
+</div>
+
+<p>第 3 行和第 5、6 行都在访问 <code>data</code>，但谁先谁后没有任何保证。于是有三种可能的结果：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="竞态条件的三种可能执行顺序">
+  <!-- 面板 1 -->
+  <rect class="fill-soft" x="10" y="10" width="236" height="250" rx="12"/>
+  <text class="ttl" x="128" y="36" text-anchor="middle">结果 ①：什么都不打印</text>
+  <rect class="bx-b" x="38" y="56" width="180" height="36" rx="8"/>
+  <text class="mono on-b" x="128" y="79" text-anchor="middle">data++　(goroutine)</text>
+  <path class="ln" d="M128 94 V112" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="38" y="116" width="180" height="36" rx="8"/>
+  <text class="mono on-a" x="128" y="139" text-anchor="middle">data == 0 ? → false</text>
+  <text class="lbl" x="128" y="230" text-anchor="middle">（没有输出）</text>
+
+  <!-- 面板 2 -->
+  <rect class="fill-soft" x="262" y="10" width="236" height="250" rx="12"/>
+  <text class="ttl" x="380" y="36" text-anchor="middle">结果 ②：the value is 0</text>
+  <rect class="bx-a" x="290" y="56" width="180" height="36" rx="8"/>
+  <text class="mono on-a" x="380" y="79" text-anchor="middle">data == 0 ? → true</text>
+  <path class="ln" d="M380 94 V112" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="290" y="116" width="180" height="36" rx="8"/>
+  <text class="mono on-g" x="380" y="139" text-anchor="middle">Printf(data) → 0</text>
+  <path class="ln" d="M380 154 V172" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="290" y="176" width="180" height="36" rx="8"/>
+  <text class="mono on-b" x="380" y="199" text-anchor="middle">data++　(太晚了)</text>
+  <text class="lbl" x="380" y="240" text-anchor="middle">打印 0</text>
+
+  <!-- 面板 3 -->
+  <rect class="fill-soft" x="514" y="10" width="236" height="250" rx="12"/>
+  <text class="ttl" x="632" y="36" text-anchor="middle">结果 ③：the value is 1</text>
+  <rect class="bx-a" x="542" y="56" width="180" height="36" rx="8"/>
+  <text class="mono on-a" x="632" y="79" text-anchor="middle">data == 0 ? → true</text>
+  <path class="ln" d="M632 94 V112" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="542" y="116" width="180" height="36" rx="8"/>
+  <text class="mono on-b" x="632" y="139" text-anchor="middle">data++　(插了进来)</text>
+  <path class="ln" d="M632 154 V172" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="542" y="176" width="180" height="36" rx="8"/>
+  <text class="mono on-g" x="632" y="199" text-anchor="middle">Printf(data) → 1</text>
+  <text class="lbl" x="632" y="240" text-anchor="middle">判断时是 0，打印时却是 1</text>
+</svg>
+<figcaption>图 1-3　短短几行代码，三种结果。蓝色是新 goroutine 的操作，橙色和绿色是主 goroutine 的操作</figcaption>
+</figure>
+
+<p>
+  数据竞争之所以出现，多半是因为开发者在用<strong>顺序思维</strong>思考：以为写在前面的代码就会先执行，
+  以为上面的 goroutine 会在 <code>if</code> 判断之前跑完。作者给了一个很好用的思考技巧：
+</p>
+
+<div class="box tip">
+  <div class="t">&#10003; 「一小时」思想实验</div>
+  <p>
+    想象两个操作之间过去了<strong>一个小时</strong>：goroutine 被创建后过了一小时才开始跑；或者 goroutine 跑完后过了一小时程序才走到 <code>if</code>。
+    程序其余部分会怎么表现？对计算机来说时间尺度不同，但<em>相对</em>的时间差是一样的。
+  </p>
+</div>
+
+<p>有人会想：那我在中间睡一会儿，等 goroutine 跑完不就行了？</p>
+
+<div class="code" data-lang="go" data-tone="bad" data-file="✗ 不要这样做">
+<pre>
+var data int
+go func() { data++ }()
+time.Sleep(1 * time.Second) // 这是坏主意！
+if data == 0 {
+	fmt.Printf("the value is %v.\n", data)
+}
+</pre>
+</div>
+
+<p>
+  数据竞争解决了吗？<strong>没有</strong>。三种结果依然都可能出现，只是越来越不可能。睡得越久，程序越「接近」正确，
+  但这个概率只会无限逼近、永远达不到逻辑上的正确。而且我们白白让程序多等了一秒。
+</p>
+
+<div class="box key">
+  <div class="t">&#9733; 永远追求逻辑正确</div>
+  <p>
+    在代码里加 <code>sleep</code> 调试并发问题可以，但它<strong>不是解决方案</strong>。竞态条件是最阴险的一类 bug：
+    它们可能在生产环境潜伏好几年，直到某次环境变化让「几乎总是按顺序执行」变成「这次没按顺序」。
+  </p>
+</div>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：先让工具帮你找 <span class="ver">-race</span><span class="ver">Go 1.19 内存模型</span></div>
+  <p>
+    Go 自带<strong>竞态检测器</strong>：<code>go run -race main.go</code> 或 <code>go test -race ./...</code>。
+    对上面的程序，它会直接报告 <code>WARNING: DATA RACE</code> 并指出读写双方的代码位置（详见<a href="ch07.html#race">附录 A</a>）。
+    另外，Go 1.19 正式修订了<a href="https://go.dev/ref/mem">内存模型</a>：没有数据竞争的程序表现得「像顺序一致的」；
+    一旦有数据竞争，对字符串、切片、接口这类多字长的值，读到「撕裂」的半新半旧值甚至导致崩溃都是可能的。
+    所以数据竞争不是「结果可能有点不准」，而是真正的 bug。
+  </p>
+</div>
+
+<h3 id="atomic">原子性（Atomicity）</h3>
+
+<p>
+  一个操作是<strong>原子的</strong>，意思是在它所处的<em>上下文</em>里，它<strong>不可分割、不可中断</strong>：
+  要么完整地发生，要么没发生，期间这个上下文里不会有别的事插进来。
+</p>
+
+<p>
+  关键词是「<strong>上下文</strong>」。在进程内是原子的操作，在操作系统层面不一定是；在操作系统层面是原子的，在整台机器层面不一定是。
+  所以讨论原子性时，第一件事是先说清楚「在哪个范围内原子」。
+</p>
+
+<div class="box deep">
+  <div class="t">&#128270; 趣闻：游戏外挂与「原子性的上下文」</div>
+  <p>
+    2006 年，暴雪起诉 MDY 公司的外挂程序 Glider（可以自动玩《魔兽世界》），获赔 600 万美元。
+    游戏的反作弊程序 Warden 会扫描内存寻找外挂，它把「扫描内存」当成一个原子操作。
+    但 Glider 利用硬件中断，在扫描开始前把自己藏了起来 —— Warden 的扫描<strong>在进程的上下文里是原子的，在操作系统的上下文里却不是</strong>。
+  </p>
+</div>
+
+<p>来看最简单的例子 <code>i++</code>。它看起来是一步，其实是三步：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="两个 goroutine 同时执行 i++ 导致丢失更新">
+  <text class="ttl on-b" x="160" y="28" text-anchor="middle">goroutine A</text>
+  <text class="ttl" x="380" y="28" text-anchor="middle">内存中的 i</text>
+  <text class="ttl on-p" x="600" y="28" text-anchor="middle">goroutine B</text>
+  <path class="ln-d" d="M160 40 V300 M380 40 V300 M600 40 V300"/>
+
+  <rect class="bx-b" x="80" y="52" width="160" height="30" rx="7"/>
+  <text class="mono on-b" x="160" y="72" text-anchor="middle">① 读取 i → 0</text>
+  <rect class="bx" x="350" y="52" width="60" height="30" rx="7"/><text class="mono" x="380" y="72" text-anchor="middle">0</text>
+
+  <rect class="bx-p" x="520" y="92" width="160" height="30" rx="7"/>
+  <text class="mono on-p" x="600" y="112" text-anchor="middle">② 读取 i → 0</text>
+  <rect class="bx" x="350" y="92" width="60" height="30" rx="7"/><text class="mono" x="380" y="112" text-anchor="middle">0</text>
+
+  <rect class="bx-b" x="80" y="132" width="160" height="30" rx="7"/>
+  <text class="mono on-b" x="160" y="152" text-anchor="middle">③ 计算 0+1</text>
+  <rect class="bx-p" x="520" y="172" width="160" height="30" rx="7"/>
+  <text class="mono on-p" x="600" y="192" text-anchor="middle">④ 计算 0+1</text>
+
+  <rect class="bx-b" x="80" y="212" width="160" height="30" rx="7"/>
+  <text class="mono on-b" x="160" y="232" text-anchor="middle">⑤ 写回 1</text>
+  <path class="ln-b" d="M242 227 H346" marker-end="url(#ar-b)"/>
+  <rect class="bx" x="350" y="212" width="60" height="30" rx="7"/><text class="mono" x="380" y="232" text-anchor="middle">1</text>
+
+  <rect class="bx-p" x="520" y="252" width="160" height="30" rx="7"/>
+  <text class="mono on-p" x="600" y="272" text-anchor="middle">⑥ 写回 1</text>
+  <path class="ln-p" d="M518 267 H414" marker-end="url(#ar-p)"/>
+  <rect class="bx-r" x="350" y="252" width="60" height="30" rx="7"/><text class="mono on-r" x="380" y="272" text-anchor="middle">1</text>
+
+  <text class="lbl on-r" x="380" y="318" text-anchor="middle">执行了两次 i++，结果却是 1 —— B 覆盖了 A 的更新（丢失更新）</text>
+</svg>
+<figcaption>图 1-4　「读取—修改—写回」三步之间可以被别的 goroutine 插入</figcaption>
+</figure>
+
+<p>
+  每一步单独看是原子的，但<strong>原子操作组合起来，并不一定还是原子的</strong>。
+  如果上下文是「没有任何并发的程序」，那 <code>i++</code> 在这个上下文里是原子的；
+  如果 <code>i</code> 只在一个 goroutine 内部使用、不暴露给别人，那它也是原子的。
+</p>
+
+<p>
+  为什么关心原子性？因为<strong>原子的东西在并发环境里天然是安全的</strong>。大多数语句、函数、程序都不是原子的，
+  所以我们需要各种技术来「强制」原子性 —— 难点在于判断代码的哪些部分需要原子、粒度多大。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：带类型的原子变量 <span class="ver">Go 1.19+</span></div>
+  <p>
+    书中（第 1 章的活锁例子）用的是 <code>atomic.AddInt32(&amp;x, 1)</code> 这种函数式 API，很容易忘记某处直接读写了 <code>x</code>。
+    Go 1.19 起推荐用 <code>atomic.Int32</code>、<code>atomic.Int64</code>、<code>atomic.Bool</code>、<code>atomic.Pointer[T]</code> 等类型，
+    它们只能通过方法访问，从类型上杜绝了「漏掉原子操作」：
+  </p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="新写法">
+<pre>
+var hits atomic.Int64   // 零值即可用
+hits.Add(1)             // 原子 +1
+n := hits.Load()        // 原子读取
+</pre>
+  </div>
+</div>
+
+<h3 id="sync">内存访问同步</h3>
+
+<p>
+  回到数据竞争的例子，加一个 <code>else</code>，让程序无论如何都有输出。程序中需要<strong>独占访问</strong>共享资源的部分叫<strong>临界区（critical section）</strong>。
+  这个例子有三个临界区：goroutine 里的 <code>data++</code>、<code>if</code> 判断、以及 <code>Printf</code> 读取 <code>data</code>。
+</p>
+
+<p>一种保护临界区的办法是<strong>同步对内存的访问</strong>。下面的代码不是地道的 Go 写法，只是为了演示概念：</p>
+
+<div class="code" data-lang="go" data-file="memory-access-synchronization/fig-basic-memory-access-sync.go">
+<pre>
+var memoryAccess sync.Mutex // ① 用来同步对 value 内存访问的「锁」
+var value int
+go func() {
+	memoryAccess.Lock()   // ② 从这里开始，我独占这块内存
+	value++
+	memoryAccess.Unlock() // ③ 用完了，释放
+}()
+
+memoryAccess.Lock() // ④ 下面的判断和打印也需要独占
+if value == 0 {
+	fmt.Printf("the value is %v.\n", value)
+} else {
+	fmt.Printf("the value is %v.\n", value)
+}
+memoryAccess.Unlock() // ⑤ 释放
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="互斥锁像一间只有一把钥匙的房间">
+  <rect class="bx-a" x="270" y="40" width="220" height="140" rx="14"/>
+  <text class="ttl on-a" x="380" y="66" text-anchor="middle">临界区（只有一把钥匙）</text>
+  <rect class="bx" x="330" y="90" width="100" height="40" rx="8"/>
+  <text class="mono" x="380" y="115" text-anchor="middle">value</text>
+  <text class="sm" x="380" y="160" text-anchor="middle">同一时刻只有一个 goroutine 在里面</text>
+
+  <circle class="dot-b" cx="120" cy="90" r="22"/><text class="ttl" x="120" y="95" text-anchor="middle" style="fill:#fff">G1</text>
+  <path class="ln-b" d="M146 96 H264" marker-end="url(#ar-b)"/>
+  <text class="sm on-b" x="205" y="86" text-anchor="middle">Lock() 成功</text>
+
+  <circle class="dot-p" cx="120" cy="160" r="22"/><text class="ttl" x="120" y="165" text-anchor="middle" style="fill:#fff">G2</text>
+  <path class="ln-d" d="M146 160 H230"/>
+  <text class="sm on-p" x="190" y="182" text-anchor="middle">Lock() 阻塞，排队等</text>
+  <text class="ttl on-r" x="246" y="166" text-anchor="middle">✋</text>
+
+  <path class="ln-g" d="M494 110 H620" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="557" y="100" text-anchor="middle">Unlock() 交还钥匙</text>
+  <text class="lbl" x="640" y="114">下一位进入</text>
+</svg>
+<figcaption>图 1-5　互斥锁把临界区变成一间「一次只能进一个人」的房间</figcaption>
+</figure>
+
+<p>
+  我们在这里创建了一个<strong>约定</strong>：任何人想访问 <code>value</code> 的内存，必须先 <code>Lock</code>，用完 <code>Unlock</code>。
+  注意两点：
+</p>
+<ol>
+  <li><strong>约定是可以被无视的。</strong>如果有人不遵守，就没有任何独占保证。你得指望所有开发者现在和将来都守规矩 —— 这要求很高（第 4 章的「约束」会给出更好的办法）。</li>
+  <li><strong>数据竞争解决了，竞态条件没解决！</strong>到底是 goroutine 先执行，还是 <code>if/else</code> 先执行，依然不确定。我们只是把不确定的范围缩小了。</li>
+</ol>
+
+<p>此外，加锁还有性能代价。每次 <code>Lock</code> 都可能让程序停顿一下。于是又带来两个需要权衡的问题：</p>
+<ul>
+  <li>临界区是不是被频繁地进入和退出？</li>
+  <li>临界区应该多大？</li>
+</ul>
+<p>在你的程序里回答好这两个问题是一门手艺。下面这类问题，则是内存同步和其他并发建模方式共同面临的。</p>
+
+<h3 id="deadlock">死锁（Deadlock）</h3>
+
+<p>
+  前面几节讨论的是<strong>正确性</strong>：处理好它们，程序就不会给出错误答案。但还有一类问题关乎程序<strong>是否一直在做有用的事</strong>：死锁、活锁和饥饿。
+</p>
+
+<p>
+  <strong>死锁</strong>：所有并发进程都在互相等待，没有外力介入就永远无法恢复。
+  Go 运行时能检测出一部分死锁（<em>所有</em> goroutine 都阻塞时），但这对<em>预防</em>死锁帮助不大。
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+type value struct {
+	mu    sync.Mutex
+	value int
+}
+
+var wg sync.WaitGroup
+printSum := func(v1, v2 *value) {
+	defer wg.Done()
+	v1.mu.Lock()                // ① 进入 v1 的临界区
+	defer v1.mu.Unlock()        // ② 函数返回前释放
+
+	time.Sleep(2 * time.Second) // ③ 模拟工作（并触发死锁）
+	v2.mu.Lock()
+	defer v2.mu.Unlock()
+
+	fmt.Printf("sum=%v\n", v1.value+v2.value)
+}
+
+var a, b value
+wg.Add(2)
+go printSum(&amp;a, &amp;b)
+go printSum(&amp;b, &amp;a)  // 注意：参数顺序反过来了
+wg.Wait()
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+fatal error: all goroutines are asleep - deadlock!
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="两个 goroutine 以相反顺序加锁导致死锁">
+  <text class="sm" x="20" y="24">时间 →</text>
+  <text class="ttl on-b" x="20" y="70">printSum(a, b)</text>
+  <text class="ttl on-p" x="20" y="170">printSum(b, a)</text>
+
+  <rect class="bx-b" x="140" y="48" width="96" height="34" rx="7"/><text class="mono on-b" x="188" y="70" text-anchor="middle">Lock(a) ✓</text>
+  <rect class="bx" x="244" y="48" width="96" height="34" rx="7"/><text class="mono" x="292" y="70" text-anchor="middle">sleep 2s</text>
+  <rect class="bx-r" x="348" y="48" width="130" height="34" rx="7"/><text class="mono on-r" x="413" y="70" text-anchor="middle">Lock(b) ⏳ 永远等</text>
+
+  <rect class="bx-p" x="140" y="148" width="96" height="34" rx="7"/><text class="mono on-p" x="188" y="170" text-anchor="middle">Lock(b) ✓</text>
+  <rect class="bx" x="244" y="148" width="96" height="34" rx="7"/><text class="mono" x="292" y="170" text-anchor="middle">sleep 2s</text>
+  <rect class="bx-r" x="348" y="148" width="130" height="34" rx="7"/><text class="mono on-r" x="413" y="170" text-anchor="middle">Lock(a) ⏳ 永远等</text>
+
+  <!-- 右侧：等待环 -->
+  <circle class="bx-b" cx="580" cy="65" r="28"/><text class="ttl on-b" x="580" y="70" text-anchor="middle">G1</text>
+  <circle class="bx-p" cx="580" cy="185" r="28"/><text class="ttl on-p" x="580" y="190" text-anchor="middle">G2</text>
+  <rect class="bx-y" x="680" y="45" width="56" height="40" rx="8"/><text class="mono on-y" x="708" y="70" text-anchor="middle">a</text>
+  <rect class="bx-y" x="680" y="165" width="56" height="40" rx="8"/><text class="mono on-y" x="708" y="190" text-anchor="middle">b</text>
+  <path class="ln-g" d="M676 65 H612" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="644" y="56" text-anchor="middle">持有</text>
+  <path class="ln-g" d="M676 185 H612" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="644" y="210" text-anchor="middle">持有</text>
+  <path class="ln-r" style="stroke-dasharray:5 4" d="M600 86 L690 162" marker-end="url(#ar-r)"/>
+  <path class="ln-r" style="stroke-dasharray:5 4" d="M600 164 L690 88" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="716" y="129" text-anchor="middle">互相等待</text>
+  <text class="lbl" x="640" y="244" text-anchor="middle">环形等待：谁也不放手</text>
+</svg>
+<figcaption>图 1-6　两个齿轮咬死了：G1 拿着 a 等 b，G2 拿着 b 等 a</figcaption>
+</figure>
+
+<div class="box deep">
+  <div class="t">&#128270; 反讽：这个死锁例子本身有竞态</div>
+  <p>
+    为了让例子简单，作者用 <code>time.Sleep</code> 来「触发」死锁 —— 这本身就引入了竞态条件！理论上，一个 goroutine
+    完全可能在另一个开始之前就拿到并释放了两把锁，从而躲过死锁。「完美」的死锁需要正确的同步才能稳定复现。
+  </p>
+</div>
+
+<p>
+  1971 年，Edgar Coffman 总结了死锁发生的<strong>四个必要条件</strong>，现在称为<strong>科夫曼条件（Coffman Conditions）</strong>：
+</p>
+
+<div class="tw">
+<table>
+  <tr><th>条件</th><th>含义</th><th>在上面的例子里</th></tr>
+  <tr><td><strong>互斥</strong></td><td>一个资源同一时刻只能被一个并发进程独占</td><td><code>printSum</code> 需要独占 a 和 b</td></tr>
+  <tr><td><strong>持有并等待</strong></td><td>进程拿着一个资源，同时等待另一个资源</td><td>拿着 a（或 b），等另一个</td></tr>
+  <tr><td><strong>不可抢占</strong></td><td>资源只能由持有者自己释放</td><td>没有任何机制能强制夺走锁</td></tr>
+  <tr><td><strong>环形等待</strong></td><td>P1 等 P2，P2（经过一条链）又在等 P1</td><td>两个调用互相等待</td></tr>
+</table>
+</div>
+
+<div class="box key">
+  <div class="t">&#9733; 破坏任意一个条件，就能防止死锁</div>
+  <p>
+    最常用的是破坏「环形等待」：<strong>所有人都按同一个顺序加锁</strong>（比如总是先锁地址小的那个，或按 ID 排序）。
+    可惜在实际代码中这些条件常常很难推理，网上满是「为什么这段代码会死锁」的提问 —— 往往别人一指就明白，但自己就是看不出来。
+  </p>
+</div>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：能检测「部分死锁」了 <span class="ver">Go 1.26 实验 / 1.27</span></div>
+  <p>
+    书中脚注提到，运行时只能检测「所有 goroutine 都睡着」的<em>全局</em>死锁，检测<em>部分</em>死锁的提案（issue 13759）尚未实现。
+    这件事在近两个版本有了进展：Go 1.26 以实验特性（<code>GOEXPERIMENT=goroutineleakprofile</code>）引入、Go 1.27 中默认可用的
+    <code>goroutineleak</code> 性能剖析，会借助垃圾回收找出「永远阻塞在不可达的通道或锁上」的 goroutine。
+    用法见<a href="ch07.html#leak">附录 A</a>。注意它只能发现阻塞在<em>已经没人能访问到</em>的同步原语上的情况，并不是万能的死锁检测器。
+  </p>
+</div>
+
+<h3 id="livelock">活锁（Livelock）</h3>
+
+<p>
+  <strong>活锁</strong>：程序在积极地执行并发操作，但这些操作对推进程序状态毫无作用。
+</p>
+
+<p>
+  你一定遇到过：走廊里迎面走来一个人，她往一边让，你也正好往同一边让；你换到另一边，她也换了过来……
+  如果这样永远继续下去，就是活锁。来用代码模拟一下：
+</p>
+
+<div class="code" data-lang="go" data-file="livelock/fig-livelock-hallway.go（节选）">
+<pre>
+cadence := sync.NewCond(&amp;sync.Mutex{})
+go func() {
+	for range time.Tick(1 * time.Millisecond) {
+		cadence.Broadcast() // 每毫秒「打一次拍子」，让所有人步调一致
+	}
+}()
+
+takeStep := func() {
+	cadence.L.Lock()
+	cadence.Wait() // 等下一拍
+	cadence.L.Unlock()
+}
+
+// tryDir 尝试往某个方向走，返回是否成功。
+// dir 记录「有多少人想往这个方向走」。
+tryDir := func(dirName string, dir *int32, out *bytes.Buffer) bool {
+	fmt.Fprintf(out, " %v", dirName)
+	atomic.AddInt32(dir, 1)   // ① 宣布：我要往这边走
+	takeStep()                // ② 所有人以相同节奏迈步
+	if atomic.LoadInt32(dir) == 1 {
+		fmt.Fprint(out, ". Success!")
+		return true
+	}
+	takeStep()
+	atomic.AddInt32(dir, -1)  // ③ 发现走不通，放弃这个方向
+	return false
+}
+
+var left, right int32
+tryLeft := func(out *bytes.Buffer) bool { return tryDir("left", &amp;left, out) }
+tryRight := func(out *bytes.Buffer) bool { return tryDir("right", &amp;right, out) }
+</pre>
+</div>
+
+<div class="code" data-lang="go">
+<pre>
+walk := func(walking *sync.WaitGroup, name string) {
+	var out bytes.Buffer
+	defer func() { fmt.Println(out.String()) }()
+	defer walking.Done()
+	fmt.Fprintf(&amp;out, "%v is trying to scoot:", name)
+	for i := 0; i &lt; 5; i++ { // ① 人为限制尝试次数，否则程序永远不会结束
+		if tryLeft(&amp;out) || tryRight(&amp;out) { // ② 先试左边，不行再试右边
+			return
+		}
+	}
+	fmt.Fprintf(&amp;out, "\n%v tosses her hands up in exasperation!", name)
+}
+
+var peopleInHallway sync.WaitGroup // ③ 等两个人都通过或都放弃
+peopleInHallway.Add(2)
+go walk(&amp;peopleInHallway, "Alice")
+go walk(&amp;peopleInHallway, "Barbara")
+peopleInHallway.Wait()
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+Alice is trying to scoot: left right left right left right left right left right
+Alice tosses her hands up in exasperation!
+Barbara is trying to scoot: left right left right left right left right left right
+Barbara tosses her hands up in exasperation!
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="走廊活锁：两个人总是同时让向同一侧">
+  <g>
+    <rect class="bx" x="14" y="40" width="170" height="90" rx="8"/>
+    <path class="ln-d" d="M14 85 H184"/>
+    <text class="sm" x="22" y="58">left 道</text><text class="sm" x="22" y="122">right 道</text>
+    <circle class="dot-b" cx="50" cy="66" r="11"/><text class="sm" x="50" y="70" text-anchor="middle" style="fill:#fff">A</text>
+    <circle class="dot-p" cx="150" cy="66" r="11"/><text class="sm" x="150" y="70" text-anchor="middle" style="fill:#fff">B</text>
+    <text class="ttl on-r" x="100" y="72" text-anchor="middle">✕</text>
+    <text class="lbl" x="99" y="28" text-anchor="middle">第 1 拍：都往 left</text>
+  </g>
+  <g>
+    <rect class="bx" x="200" y="40" width="170" height="90" rx="8"/>
+    <path class="ln-d" d="M200 85 H370"/>
+    <circle class="dot-b" cx="236" cy="108" r="11"/><text class="sm" x="236" y="112" text-anchor="middle" style="fill:#fff">A</text>
+    <circle class="dot-p" cx="336" cy="108" r="11"/><text class="sm" x="336" y="112" text-anchor="middle" style="fill:#fff">B</text>
+    <text class="ttl on-r" x="286" y="114" text-anchor="middle">✕</text>
+    <text class="lbl" x="285" y="28" text-anchor="middle">第 2 拍：都换到 right</text>
+  </g>
+  <g>
+    <rect class="bx" x="386" y="40" width="170" height="90" rx="8"/>
+    <path class="ln-d" d="M386 85 H556"/>
+    <circle class="dot-b" cx="422" cy="66" r="11"/><text class="sm" x="422" y="70" text-anchor="middle" style="fill:#fff">A</text>
+    <circle class="dot-p" cx="522" cy="66" r="11"/><text class="sm" x="522" y="70" text-anchor="middle" style="fill:#fff">B</text>
+    <text class="ttl on-r" x="472" y="72" text-anchor="middle">✕</text>
+    <text class="lbl" x="471" y="28" text-anchor="middle">第 3 拍：又都回 left</text>
+  </g>
+  <g>
+    <rect class="bx" x="572" y="40" width="170" height="90" rx="8"/>
+    <path class="ln-d" d="M572 85 H742"/>
+    <circle class="dot-b" cx="608" cy="108" r="11"/><text class="sm" x="608" y="112" text-anchor="middle" style="fill:#fff">A</text>
+    <circle class="dot-p" cx="708" cy="108" r="11"/><text class="sm" x="708" y="112" text-anchor="middle" style="fill:#fff">B</text>
+    <text class="ttl on-r" x="658" y="114" text-anchor="middle">✕</text>
+    <text class="lbl" x="657" y="28" text-anchor="middle">第 4 拍：……</text>
+  </g>
+  <text class="lbl" x="380" y="160" text-anchor="middle">CPU 一直在忙（不停地加减计数器、迈步），但谁也没通过走廊</text>
+  <text class="sm" x="380" y="184" text-anchor="middle">解决办法：协调 —— 比如约定只有一个人让路，另一个人站着不动</text>
+</svg>
+<figcaption>图 1-7　活锁：每个人都在「礼貌地」避让，结果永远避不开</figcaption>
+</figure>
+
+<p>
+  这个例子展示了活锁最常见的成因：<strong>两个或多个并发进程都试图预防死锁，却没有相互协调</strong>。
+  作者认为活锁比死锁更难发现，因为程序<em>看起来</em>在干活：看 CPU 占用率，它确实很忙；它甚至可能输出各种「我在工作」的信号。
+</p>
+
+<h3 id="starvation">饥饿（Starvation）</h3>
+
+<p>
+  <strong>饥饿</strong>：一个并发进程拿不到完成工作所需的全部资源。活锁其实是饥饿的一个子集 —— 只不过在活锁里，所有进程「饿得一样」，谁都没干成活。
+  更常见的饥饿是：有一个或多个<strong>贪婪</strong>的进程不公平地阻止了其他进程高效工作。
+</p>
+
+<div class="code" data-lang="go" data-file="starvation/fig-example.go">
+<pre>
+var wg sync.WaitGroup
+var sharedLock sync.Mutex
+const runtime = 1 * time.Second
+
+greedyWorker := func() {
+	defer wg.Done()
+	var count int
+	for begin := time.Now(); time.Since(begin) &lt;= runtime; {
+		sharedLock.Lock()
+		time.Sleep(3 * time.Nanosecond) // 一次锁住，干完 3ns 的活
+		sharedLock.Unlock()
+		count++
+	}
+	fmt.Printf("Greedy worker was able to execute %v work loops\n", count)
+}
+
+politeWorker := func() {
+	defer wg.Done()
+	var count int
+	for begin := time.Now(); time.Since(begin) &lt;= runtime; {
+		sharedLock.Lock()               // 只在需要时加锁：
+		time.Sleep(1 * time.Nanosecond) // 分三次，每次 1ns
+		sharedLock.Unlock()
+
+		sharedLock.Lock()
+		time.Sleep(1 * time.Nanosecond)
+		sharedLock.Unlock()
+
+		sharedLock.Lock()
+		time.Sleep(1 * time.Nanosecond)
+		sharedLock.Unlock()
+		count++
+	}
+	fmt.Printf("Polite worker was able to execute %v work loops.\n", count)
+}
+
+wg.Add(2)
+go greedyWorker()
+go politeWorker()
+wg.Wait()
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="书中的输出">
+<pre>
+Polite worker was able to execute 289777 work loops.
+Greedy worker was able to execute 471287 work loops
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="贪婪 worker 与礼貌 worker 抢锁的时间线">
+  <text class="sm" x="20" y="24">锁的占用时间线 →</text>
+  <text class="ttl on-a" x="20" y="72">贪婪</text>
+  <text class="ttl on-b" x="20" y="132">礼貌</text>
+  <!-- 交替：G(3) P(1) G(3) P(1) G(3) P(1) G(3) P(1) -->
+  <rect class="bx-a" x="80"  y="52" width="96" height="30" rx="5"/><text class="sm" x="128" y="72" text-anchor="middle">一整圈</text>
+  <rect class="bx-b" x="178" y="112" width="32" height="30" rx="5"/><text class="sm" x="194" y="132" text-anchor="middle">⅓</text>
+  <rect class="bx-a" x="212" y="52" width="96" height="30" rx="5"/><text class="sm" x="260" y="72" text-anchor="middle">一整圈</text>
+  <rect class="bx-b" x="310" y="112" width="32" height="30" rx="5"/><text class="sm" x="326" y="132" text-anchor="middle">⅓</text>
+  <rect class="bx-a" x="344" y="52" width="96" height="30" rx="5"/><text class="sm" x="392" y="72" text-anchor="middle">一整圈</text>
+  <rect class="bx-b" x="442" y="112" width="32" height="30" rx="5"/><text class="sm" x="458" y="132" text-anchor="middle">⅓</text>
+  <rect class="bx-a" x="476" y="52" width="96" height="30" rx="5"/><text class="sm" x="524" y="72" text-anchor="middle">一整圈</text>
+  <rect class="bx-b" x="574" y="112" width="32" height="30" rx="5"/><text class="sm" x="590" y="132" text-anchor="middle">⅓</text>
+  <rect class="bx-a" x="608" y="52" width="96" height="30" rx="5"/><text class="sm" x="656" y="72" text-anchor="middle">…</text>
+  <text class="lbl" x="380" y="172" text-anchor="middle">礼貌 worker 每释放一次锁，贪婪 worker 就可能趁机拿走一整圈</text>
+  <text class="sm" x="380" y="192" text-anchor="middle">同样时间里：贪婪完成 4 圈，礼貌只完成 1 圈多</text>
+</svg>
+<figcaption>图 1-8　两者做的「实际工作」一样多（都是 3ns），但贪婪者把锁持有范围扩大到了临界区之外</figcaption>
+</figure>
+
+<p>
+  不要得出「贪婪算法更高效」或「Lock/Unlock 很慢」的结论（它们不慢）。正确的结论是：<strong>贪婪 worker 不必要地把锁的持有范围扩大到了临界区之外，
+  通过饥饿阻碍了礼貌 worker 的工作。</strong>
+</p>
+
+<p>
+  注意我们是怎么发现饥饿的：<strong>靠一个指标（metric）</strong>。这是记录和采样指标的好理由 ——
+  记录工作完成的时刻，再看工作速率是否符合预期。
+</p>
+
+<div class="box tip">
+  <div class="t">&#10003; 寻找平衡：粗粒度 vs 细粒度</div>
+  <p>
+    这个例子也说明了内存同步的性能代价。把锁的范围扩大（粗粒度）可能对性能有利，但会让别人挨饿；
+    范围小（细粒度）对公平有利。作者建议：<strong>一开始只在临界区加锁</strong>；如果同步真的成了性能瓶颈，再扩大范围。反过来收窄要难得多。
+  </p>
+</div>
+
+<p>饥饿也可能来自 Go 进程之外：CPU、内存、文件句柄、数据库连接 —— 任何需要共享的资源都可能被「饿」到。</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：Mutex 有了「饥饿模式」 <span class="ver">Go 1.9+</span></div>
+  <p>
+    书出版后不久，Go 1.9 给 <code>sync.Mutex</code> 加入了<strong>饥饿模式</strong>：如果某个等待者等锁超过 1ms，
+    锁会切换到饥饿模式，此时解锁者把锁<strong>直接交给队首的等待者</strong>，新来的 goroutine 不能插队，直到饥饿解除。
+    所以在新版 Go 上跑这个例子，两个 worker 的差距通常会小一些（具体数字取决于机器）。但这不改变本节的结论：
+    锁的范围应该只覆盖临界区，而饥饿要靠指标来发现。
+  </p>
+</div>
+
+<h3 id="safety">确定并发安全</h3>
+
+<p>
+  最后，也是最难的一点：<strong>人</strong>。每行代码背后至少有一个人。作为调用者，你常常看不出一段代码是否用了并发、该怎样安全地使用它。看这个签名：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+// CalculatePi calculates digits of Pi between the begin and end
+// place.
+func CalculatePi(begin, end int64, pi *Pi)
+</pre>
+</div>
+
+<p>它引出一连串问题：</p>
+<ul>
+  <li>我要怎样用它并发地计算？</li>
+  <li>需要我自己启动多个并发调用吗？</li>
+  <li>所有调用都在直接操作我传进去的那个 <code>*Pi</code>，我要负责同步对它的访问吗？还是 <code>Pi</code> 类型自己处理了？</li>
+</ul>
+
+<p>注释可以创造奇迹：</p>
+
+<div class="code" data-lang="go">
+<pre>
+// CalculatePi calculates digits of Pi between the begin and end
+// place.
+//
+// Internally, CalculatePi will create FLOOR((end-begin)/2) concurrent
+// processes which recursively call CalculatePi. Synchronization of
+// writes to pi are handled internally by the Pi struct.
+func CalculatePi(begin, end int64, pi *Pi)
+</pre>
+</div>
+
+<div class="box key">
+  <div class="t">&#9733; 涉及并发的 API，注释要回答三个问题</div>
+  <ol>
+    <li><strong>谁负责并发？</strong>（函数内部会启动 goroutine，还是要调用者自己开？）</li>
+    <li><strong>问题空间是怎样映射到并发原语上的？</strong></li>
+    <li><strong>谁负责同步？</strong></li>
+  </ol>
+</div>
+
+<p>也许这种模糊本身说明我们建模错了。换一种函数式的思路，让函数没有副作用，甚至用返回类型来传递信号：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="CalculatePi 函数签名的三次演进">
+  <rect class="bx-r" x="10" y="30" width="230" height="110" rx="10"/>
+  <text class="ttl on-r" x="125" y="54" text-anchor="middle">① 传指针进去</text>
+  <text class="mono" x="125" y="80" text-anchor="middle" style="font-size:10.5px">CalculatePi(b, e, pi *Pi)</text>
+  <text class="sm" x="125" y="104" text-anchor="middle">谁同步 pi？谁开 goroutine？</text>
+  <text class="sm" x="125" y="122" text-anchor="middle">全靠注释说明</text>
+
+  <path class="ln" d="M244 85 H272" marker-end="url(#ar)"/>
+  <rect class="bx-y" x="276" y="30" width="230" height="110" rx="10"/>
+  <text class="ttl on-y" x="391" y="54" text-anchor="middle">② 返回切片</text>
+  <text class="mono" x="391" y="80" text-anchor="middle" style="font-size:10.5px">CalculatePi(b, e) []uint</text>
+  <text class="sm" x="391" y="104" text-anchor="middle">无副作用，不用操心同步</text>
+  <text class="sm" x="391" y="122" text-anchor="middle">但看不出是否用了并发</text>
+
+  <path class="ln" d="M510 85 H538" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="542" y="30" width="208" height="110" rx="10"/>
+  <text class="ttl on-g" x="646" y="54" text-anchor="middle">③ 返回只读通道</text>
+  <text class="mono" x="646" y="80" text-anchor="middle" style="font-size:10.5px">CalculatePi(b, e) &lt;-chan uint</text>
+  <text class="sm" x="646" y="104" text-anchor="middle">暗示：内部至少有一个</text>
+  <text class="sm" x="646" y="122" text-anchor="middle">goroutine，不用你再开</text>
+  <text class="lbl" x="380" y="178" text-anchor="middle">签名本身就是文档：越能「一眼看懂」，调用者越容易做对</text>
+</svg>
+<figcaption>图 1-9　用函数签名传达并发语义</figcaption>
+</figure>
+
+<p>
+  这些改动也会带来性能上的影响，我们又回到了清晰与性能之间的权衡。清晰很重要，因为我们希望将来维护代码的人尽可能做对的事；
+  性能的重要性则不言而喻。两者并不互斥，但很难兼顾。再把这些沟通上的难题放大到整个团队 —— 哇，这真是个问题。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：不需要并发时，考虑迭代器 <span class="ver">Go 1.23+</span></div>
+  <p>
+    「返回通道」在书里是表达「这是一个数据流」的惯用法。但如果数据流<strong>只是为了逐个产出值、并不需要并发</strong>，
+    Go 1.23 起更推荐返回迭代器 <code>iter.Seq[uint]</code>，调用者照样用 <code>for d := range CalculatePi(b, e)</code> 遍历，
+    却没有 goroutine 和通道的开销，也不用担心 goroutine 泄漏。返回通道，则明确表示「背后真的有并发」。
+  </p>
+</div>
+
+<h2 id="simple">在复杂性面前保持简单</h2>
+
+<p>
+  前面描绘的图景相当灰暗，但作者想给你希望：这些问题并非无解。Go 没有「解决」它们，但让它们<strong>容易得多</strong>。
+  Go 的运行时承担了大部分重活（第 6 章详解），这里先说它怎样让你的生活变轻松。
+</p>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#9851;</span><h4>并发、低延迟的垃圾回收器</h4><p>内存管理本身就难，和并发混在一起更难。Go 1.8 时 GC 停顿已经在 10–100 微秒级别。你不必在并发进程之间手动管理内存。</p></div>
+  <div class="card"><span class="ic">&#129526;</span><h4>自动把 goroutine 复用到线程上</h4><p>不必自己创建线程池、把连接分配到线程、再让每个连接「可暂停」以便公平分享 CPU。</p></div>
+  <div class="card"><span class="ic">&#128279;</span><h4>可组合的通道</h4><p>通道是一种并发安全、可以组合的通信方式，让「把大问题拆成小问题」变得容易。</p></div>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="传统线程池模型与 Go 每连接一个 goroutine 模型的对比">
+  <text class="ttl" x="185" y="24" text-anchor="middle">传统做法：线程池</text>
+  <text class="ttl" x="575" y="24" text-anchor="middle">Go 的做法：每个连接一个 goroutine</text>
+  <path class="ln-d" d="M380 14 V260"/>
+
+  <!-- 左 -->
+  <rect class="bx" x="20" y="44" width="80" height="26" rx="6"/><text class="sm" x="60" y="61" text-anchor="middle">连接 1</text>
+  <rect class="bx" x="20" y="76" width="80" height="26" rx="6"/><text class="sm" x="60" y="93" text-anchor="middle">连接 2</text>
+  <rect class="bx" x="20" y="108" width="80" height="26" rx="6"/><text class="sm" x="60" y="125" text-anchor="middle">连接 3</text>
+  <rect class="bx" x="20" y="140" width="80" height="26" rx="6"/><text class="sm" x="60" y="157" text-anchor="middle">连接 4</text>
+  <rect class="bx" x="20" y="172" width="80" height="26" rx="6"/><text class="sm" x="60" y="189" text-anchor="middle">……</text>
+  <path class="ln" d="M102 57 L180 90 M102 89 L180 92 M102 121 L180 150 M102 153 L180 156 M102 185 L180 160"/>
+  <rect class="bx-r" x="184" y="70" width="120" height="44" rx="8"/><text class="sm on-r" x="244" y="88" text-anchor="middle">线程 A</text><text class="sm" x="244" y="104" text-anchor="middle">轮流服务连接 1、2</text>
+  <rect class="bx-r" x="184" y="132" width="120" height="44" rx="8"/><text class="sm on-r" x="244" y="150" text-anchor="middle">线程 B</text><text class="sm" x="244" y="166" text-anchor="middle">轮流服务 3、4、…</text>
+  <text class="sm" x="185" y="214" text-anchor="middle">你要操心：池子多大？怎么分配？</text>
+  <text class="sm" x="185" y="232" text-anchor="middle">处理逻辑怎样写成「可暂停」以公平分享？</text>
+
+  <!-- 右 -->
+  <rect class="bx" x="410" y="44" width="80" height="26" rx="6"/><text class="sm" x="450" y="61" text-anchor="middle">连接 1</text>
+  <rect class="bx" x="410" y="76" width="80" height="26" rx="6"/><text class="sm" x="450" y="93" text-anchor="middle">连接 2</text>
+  <rect class="bx" x="410" y="108" width="80" height="26" rx="6"/><text class="sm" x="450" y="125" text-anchor="middle">连接 3</text>
+  <rect class="bx" x="410" y="140" width="80" height="26" rx="6"/><text class="sm" x="450" y="157" text-anchor="middle">连接 4</text>
+  <rect class="bx" x="410" y="172" width="80" height="26" rx="6"/><text class="sm" x="450" y="189" text-anchor="middle">……</text>
+  <path class="ln-c" d="M492 57 H530 M492 89 H530 M492 121 H530 M492 153 H530 M492 185 H530"/>
+  <rect class="bx-c" x="534" y="44" width="96" height="26" rx="6"/><text class="mono on-c" x="582" y="61" text-anchor="middle">go handle()</text>
+  <rect class="bx-c" x="534" y="76" width="96" height="26" rx="6"/><text class="mono on-c" x="582" y="93" text-anchor="middle">go handle()</text>
+  <rect class="bx-c" x="534" y="108" width="96" height="26" rx="6"/><text class="mono on-c" x="582" y="125" text-anchor="middle">go handle()</text>
+  <rect class="bx-c" x="534" y="140" width="96" height="26" rx="6"/><text class="mono on-c" x="582" y="157" text-anchor="middle">go handle()</text>
+  <rect class="bx-c" x="534" y="172" width="96" height="26" rx="6"/><text class="mono on-c" x="582" y="189" text-anchor="middle">…</text>
+  <rect class="bx-d" x="650" y="60" width="96" height="124" rx="8"/>
+  <text class="sm" x="698" y="114" text-anchor="middle">Go 运行时</text>
+  <text class="sm" x="698" y="132" text-anchor="middle">自动调度</text>
+  <path class="ln-d" d="M632 122 H648"/>
+  <text class="sm" x="575" y="232" text-anchor="middle">你只写处理一个连接的函数，前面加 go</text>
+</svg>
+<figcaption>图 1-10　哪种模型更可能让你愿意使用并发？哪种更可能写对？</figcaption>
+</figure>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：垃圾回收继续进化 <span class="ver">Go 1.26+</span></div>
+  <p>
+    书中「Go 1.8 的 GC 停顿在 10–100 微秒」的说法今天依然成立，而且 GC 在吞吐上还在持续改进：
+    Go 1.26 默认启用了新的 <strong>Green Tea</strong> 垃圾回收器，对大量小对象的场景更友好，可以通过 <code>GOEXPERIMENT=nogreenteagc</code> 关闭。
+    对大多数并发程序来说，你依然完全不需要关心 GC 细节。
+  </p>
+</div>
+
+<h2 id="summary">本章小结</h2>
+
+<div class="tw">
+<table>
+  <tr><th>问题</th><th>一句话描述</th><th>典型对策</th></tr>
+  <tr><td>竞态条件</td><td>操作顺序没有保证</td><td>建立明确的同步点（join point），别用 sleep</td></tr>
+  <tr><td>数据竞争</td><td>并发读写同一变量且没有同步</td><td>互斥锁、通道、约束；用 <code>-race</code> 检测</td></tr>
+  <tr><td>原子性</td><td>「一步」其实是多步，会被插入</td><td>先定义上下文；用锁或 <code>sync/atomic</code></td></tr>
+  <tr><td>死锁</td><td>互相等待，永不恢复</td><td>打破科夫曼条件之一，如统一加锁顺序</td></tr>
+  <tr><td>活锁</td><td>很忙，但没进展</td><td>协调各方，而不是各自「礼让」</td></tr>
+  <tr><td>饥饿</td><td>资源被贪婪者霸占</td><td>锁只覆盖临界区；用指标监控工作速率</td></tr>
+</table>
+</div>
+
+<div class="exercise">
+  <h3>&#9998; 动手练习</h3>
+  <ol>
+    <li>运行 <code>fig-basic-race-condition.go</code> 很多次（比如 <code>for i in $(seq 100); do go run main.go; done</code>），统计三种结果各出现了几次。再用 <code>go run -race</code> 跑一次，读懂报告。</li>
+    <li>修改死锁例子，让两个 goroutine 都按「先 a 后 b」的顺序加锁，确认死锁消失。说说你破坏了哪个科夫曼条件。</li>
+    <li>把饥饿例子里的礼貌 worker 改成一次锁住 3ns，比较两者的计数。再思考：如果真实的临界区只有 1ns，粗粒度锁的代价在哪里？</li>
+    <li>给你写过的一个并发函数补上注释，回答「谁负责并发、怎样映射、谁负责同步」三个问题。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -1,0 +1,1897 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 3 章 · Go 的并发构件 — Go 并发编程图解笔记</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="3">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 3 章</span>
+<h1>Go 的并发构件</h1>
+<p class="lede">
+  从这一章开始写代码。我们会逐一认识 Go 提供的并发「积木」：goroutine、<code>sync</code> 包里的
+  <code>WaitGroup</code>、<code>Mutex</code>、<code>Cond</code>、<code>Once</code>、<code>Pool</code>，
+  以及通道（channel）和 <code>select</code>。如果你之前没在 Go 里写过并发，这一章就是起点。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>会启动 goroutine，理解 fork-join 模型和「汇合点」</li>
+    <li>理解闭包捕获变量的行为，以及 Go 1.22 对循环变量的修改</li>
+    <li>知道 <code>sync</code> 包里每种原语解决什么问题、有哪些坑</li>
+    <li>熟练掌握通道的阻塞、关闭、缓冲、nil 通道等全部行为，并学会「通道所有权」</li>
+    <li>会用 <code>select</code> 实现等待多个事件、超时和非阻塞操作</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<!-- ============================================================ -->
+<h2 id="goroutine">goroutine</h2>
+
+<p>
+  goroutine 是 Go 程序最基本的组织单位之一。每个 Go 程序至少有一个 goroutine：<strong>主 goroutine</strong>，进程启动时自动创建。
+  简单地说，<strong>goroutine 就是一个与其他代码并发运行（记住：不一定并行！）的函数</strong>。在函数调用前加上 <code>go</code> 关键字就能启动一个：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+func main() {
+	go sayHello()
+	// 继续做别的事
+}
+
+func sayHello() {
+	fmt.Println("hello")
+}
+</pre>
+</div>
+
+<p>匿名函数也可以（注意必须立即调用，即末尾的 <code>()</code>）；也可以先把函数赋给变量再调用：</p>
+
+<div class="vs">
+  <div class="old"><div class="h">匿名函数</div>
+<div class="code" data-lang="go"><pre>
+go func() {
+	fmt.Println("hello")
+}()
+// 继续做别的事
+</pre></div></div>
+  <div class="new"><div class="h">函数变量</div>
+<div class="code" data-lang="go"><pre>
+sayHello := func() {
+	fmt.Println("hello")
+}
+go sayHello()
+// 继续做别的事
+</pre></div></div>
+</div>
+
+<p>就这么简单！一个关键字，就创建了一块并发逻辑。剩下的内容讲的是怎样正确地使用、同步和组织它们。</p>
+
+<h3 id="what-is">goroutine 到底是什么？</h3>
+
+<p>
+  goroutine 不是操作系统线程，也不完全是「绿色线程」（由语言运行时管理的线程）。它是一种更高层的抽象，叫做<strong>协程（coroutine）</strong>。
+  协程是并发的子程序（函数、闭包或方法），它们是<strong>非抢占式</strong>的 —— 不能被打断，只能在若干「可以暂停或重入」的点上让出执行。
+</p>
+
+<p>
+  goroutine 的独特之处在于它和 Go 运行时的深度整合：goroutine 自己不定义暂停点，而是由<strong>运行时观察它的行为</strong>，
+  在它阻塞时自动挂起、解除阻塞时再恢复。从某种意义上说，这让它们变得可抢占，但只在阻塞的地方。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：goroutine 现在几乎随处可被抢占 <span class="ver">Go 1.14+</span></div>
+  <p>
+    书中描述的是 Go 1.13 及以前的「协作式」调度：goroutine 只在阻塞、系统调用或函数调用时才可能被换下。
+    Go 1.14 引入了<strong>基于信号的异步抢占</strong>：一个长时间运行、甚至没有任何函数调用的紧密循环，也会被运行时强行打断，
+    不会再霸占线程、拖慢垃圾回收甚至造成卡死。第 6 章会再提到这一点。
+  </p>
+</div>
+
+<p>
+  Go 托管 goroutine 的机制是一个 <strong>M:N 调度器</strong>：把 M 个绿色线程映射到 N 个操作系统线程上，goroutine 再被调度到这些绿色线程上。
+  goroutine 比可用线程多时，调度器负责分配，并保证某些 goroutine 阻塞时，其他的还能运行。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="M:N 调度：大量 goroutine 被调度到少量操作系统线程上">
+  <text class="lbl" x="20" y="34">成千上万个 goroutine</text>
+  <g>
+    <circle class="dot-c" cx="200" cy="30" r="10"/><circle class="dot-c" cx="228" cy="30" r="10"/><circle class="dot-c" cx="256" cy="30" r="10"/>
+    <circle class="dot-c" cx="284" cy="30" r="10"/><circle class="dot-c" cx="312" cy="30" r="10"/><circle class="dot-c" cx="340" cy="30" r="10"/>
+    <circle class="dot-c" cx="368" cy="30" r="10"/><circle class="dot-c" cx="396" cy="30" r="10"/><circle class="dot-c" cx="424" cy="30" r="10"/>
+    <circle class="dot-c" cx="452" cy="30" r="10"/><circle class="dot-c" cx="480" cy="30" r="10"/><circle class="dot-c" cx="508" cy="30" r="10"/>
+    <circle class="dot-c" cx="536" cy="30" r="10"/><circle class="dot-c" cx="564" cy="30" r="10"/>
+    <text class="sm" x="590" y="34">…… 十万个也没问题</text>
+  </g>
+  <path class="ln-c" d="M380 46 V70" marker-end="url(#ar-c)"/>
+  <rect class="bx-a" x="140" y="76" width="480" height="48" rx="10"/>
+  <text class="ttl on-a" x="380" y="98" text-anchor="middle">Go 运行时调度器（M:N）</text>
+  <text class="sm" x="380" y="116" text-anchor="middle">阻塞时挂起、就绪时恢复，在少量线程上轮流运行 goroutine</text>
+  <path class="ln" d="M250 126 V150 M380 126 V150 M510 126 V150"/>
+  <text class="lbl" x="20" y="170">少量 OS 线程</text>
+  <rect class="bx-b" x="200" y="152" width="100" height="32" rx="7"/><text class="mono on-b" x="250" y="173" text-anchor="middle">线程 1</text>
+  <rect class="bx-b" x="330" y="152" width="100" height="32" rx="7"/><text class="mono on-b" x="380" y="173" text-anchor="middle">线程 2</text>
+  <rect class="bx-b" x="460" y="152" width="100" height="32" rx="7"/><text class="mono on-b" x="510" y="173" text-anchor="middle">线程 3</text>
+  <path class="ln" d="M250 186 V200 M380 186 V200 M510 186 V200"/>
+  <text class="lbl" x="20" y="218">CPU 核心</text>
+  <rect class="bx" x="200" y="202" width="360" height="22" rx="6"/><text class="sm" x="380" y="217" text-anchor="middle">核心 × N</text>
+</svg>
+<figcaption>图 3-1　M:N 调度：大量 goroutine 复用少量线程（第 6 章细讲）</figcaption>
+</figure>
+
+<h3 id="fork-join">fork-join 模型与汇合点</h3>
+
+<p>
+  Go 遵循 <strong>fork-join（分叉—汇合）</strong>并发模型。<em>fork</em> 指程序在任何时刻都可以分出一个子执行分支，与父分支并发运行；
+  <em>join</em> 指未来某个时刻这些分支会重新汇合。子分支重新汇入父分支的地方叫做<strong>汇合点（join point）</strong>。
+  <code>go</code> 语句就是 Go 执行 fork 的方式，分出来的执行线索就是 goroutine。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="fork-join 模型：主 goroutine 分叉出子 goroutine，在汇合点等待其结束">
+  <path class="ln-a" d="M40 60 H720" marker-end="url(#ar-a)"/>
+  <text class="ttl on-a" x="40" y="44">主 goroutine</text>
+  <circle class="dot-a" cx="160" cy="60" r="6"/>
+  <text class="sm" x="150" y="84" text-anchor="end">fork：go sayHello()</text>
+  <path class="ln-c" d="M160 66 C 190 130, 220 150, 260 150 H440 C 480 150, 510 130, 540 66" marker-end="url(#ar-c)"/>
+  <text class="ttl on-c" x="350" y="140" text-anchor="middle">子 goroutine：sayHello()</text>
+  <text class="sm" x="350" y="170" text-anchor="middle">与主 goroutine 并发运行</text>
+  <circle class="dot-g" cx="540" cy="60" r="8"/>
+  <text class="ttl on-g" x="540" y="36" text-anchor="middle">join point（汇合点）</text>
+  <text class="sm" x="552" y="84">wg.Wait()：在这里等子分支结束</text>
+  <text class="sm" x="350" y="200" text-anchor="middle">没有汇合点，就无法保证子 goroutine 在程序退出前运行过</text>
+</svg>
+<figcaption>图 3-2　fork-join 模型</figcaption>
+</figure>
+
+<p>
+  回到最初的例子：<code>sayHello</code> 在自己的 goroutine 里运行，程序继续往下走，<strong>没有汇合点</strong>。
+  这有一个问题：<code>sayHello</code> 到底会不会运行是不确定的。goroutine 被创建并交给运行时调度，但可能还没轮到它，主 goroutine 就退出了。
+  在 <code>go</code> 之后加个 <code>time.Sleep</code>？回忆第 1 章：那只是竞态条件，不是汇合点。我们需要的是同步。这里先用 <code>sync.WaitGroup</code>（稍后详解）：
+</p>
+
+<div class="code" data-lang="go" data-file="goroutines/fig-join-point.go">
+<pre>
+var wg sync.WaitGroup
+sayHello := func() {
+	defer wg.Done()
+	fmt.Println("hello")
+}
+wg.Add(1)
+go sayHello()
+wg.Wait() // ← 这里就是汇合点
+</pre>
+</div>
+
+<p>这个程序会<strong>确定地</strong>阻塞主 goroutine，直到 <code>sayHello</code> 所在的 goroutine 结束，输出 <code>hello</code>。</p>
+
+<h3 id="closure">goroutine 与闭包</h3>
+
+<p>
+  闭包会「包住」它被创建时的词法作用域，从而捕获变量。在 goroutine 里运行闭包时，闭包操作的是变量的副本，还是原变量本身？试一下：
+</p>
+
+<div class="code" data-lang="go" data-file="goroutines/fig-goroutine-closure.go">
+<pre>
+var wg sync.WaitGroup
+salutation := "hello"
+wg.Add(1)
+go func() {
+	defer wg.Done()
+	salutation = "welcome" // goroutine 修改了外面的变量
+}()
+wg.Wait()
+fmt.Println(salutation) // 输出：welcome
+</pre>
+</div>
+
+<p>
+  输出 <code>welcome</code>。goroutine 和创建它的代码运行在<strong>同一个地址空间</strong>里，闭包拿到的是原变量。再看一个更微妙的例子：
+</p>
+
+<div class="code" data-lang="go" data-file="goroutines/fig-goroutine-closure-loop.go">
+<pre>
+var wg sync.WaitGroup
+for _, salutation := range []string{"hello", "greetings", "good day"} {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fmt.Println(salutation) // 引用了循环变量
+	}()
+}
+wg.Wait()
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="书中（Go 1.8）的输出">
+<pre>
+good day
+good day
+good day
+</pre>
+</div>
+
+<p>
+  很多人以为会以某种顺序打印三个不同的词，结果却是三个 <code>good day</code>。原因是：在旧版 Go 里，
+  整个循环<strong>只有一个</strong> <code>salutation</code> 变量，每轮迭代只是给它赋新值。goroutine 可能在未来任何时候才运行，
+  在作者的机器上，循环往往在任何 goroutine 开始之前就结束了，此时 <code>salutation</code> 的值是最后一个 <code>"good day"</code>。
+</p>
+
+<p>
+  循环结束后变量不是「出作用域」了吗？goroutine 还能访问吗？这里体现了 Go 的内存管理：编译器注意到这个变量仍被引用，
+  于是把它的内存<strong>转移到堆上</strong>（逃逸分析），goroutine 可以继续安全访问。书中的正确写法是把当前值作为参数传进去，让每个 goroutine 拿到自己的副本：
+</p>
+
+<div class="code" data-lang="go" data-file="goroutines/fig-goroutine-closure-loop-correct.go">
+<pre>
+var wg sync.WaitGroup
+for _, salutation := range []string{"hello", "greetings", "good day"} {
+	wg.Add(1)
+	go func(salutation string) { // ① 声明参数，故意与外层同名（遮蔽）
+		defer wg.Done()
+		fmt.Println(salutation)
+	}(salutation) // ② 把本轮的值复制进去
+}
+wg.Wait()
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="Go 1.21 及之前所有 goroutine 共享一个循环变量；Go 1.22 起每轮迭代有独立变量">
+  <text class="ttl on-r" x="185" y="26" text-anchor="middle">Go ≤ 1.21：整个循环共享一个变量</text>
+  <text class="ttl on-c" x="575" y="26" text-anchor="middle">Go ≥ 1.22：每轮迭代一个新变量</text>
+  <path class="ln-d" d="M380 14 V236"/>
+
+  <rect class="bx-r" x="120" y="150" width="130" height="40" rx="8"/>
+  <text class="mono on-r" x="185" y="175" text-anchor="middle">"good day"</text>
+  <text class="sm" x="185" y="208" text-anchor="middle">salutation（唯一一个，被反复赋值）</text>
+  <circle class="dot-b" cx="80" cy="70" r="16"/><text class="sm" x="80" y="74" text-anchor="middle" style="fill:#fff">G1</text>
+  <circle class="dot-b" cx="185" cy="70" r="16"/><text class="sm" x="185" y="74" text-anchor="middle" style="fill:#fff">G2</text>
+  <circle class="dot-b" cx="290" cy="70" r="16"/><text class="sm" x="290" y="74" text-anchor="middle" style="fill:#fff">G3</text>
+  <path class="ln-r" d="M88 86 L150 146" marker-end="url(#ar-r)"/>
+  <path class="ln-r" d="M185 88 V146" marker-end="url(#ar-r)"/>
+  <path class="ln-r" d="M282 86 L220 146" marker-end="url(#ar-r)"/>
+
+  <rect class="bx-c" x="410" y="150" width="100" height="40" rx="8"/><text class="mono on-c" x="460" y="175" text-anchor="middle">"hello"</text>
+  <rect class="bx-c" x="525" y="150" width="100" height="40" rx="8"/><text class="mono on-c" x="575" y="175" text-anchor="middle">"greetings"</text>
+  <rect class="bx-c" x="640" y="150" width="100" height="40" rx="8"/><text class="mono on-c" x="690" y="175" text-anchor="middle">"good day"</text>
+  <circle class="dot-b" cx="460" cy="70" r="16"/><text class="sm" x="460" y="74" text-anchor="middle" style="fill:#fff">G1</text>
+  <circle class="dot-b" cx="575" cy="70" r="16"/><text class="sm" x="575" y="74" text-anchor="middle" style="fill:#fff">G2</text>
+  <circle class="dot-b" cx="690" cy="70" r="16"/><text class="sm" x="690" y="74" text-anchor="middle" style="fill:#fff">G3</text>
+  <path class="ln-c" d="M460 88 V146" marker-end="url(#ar-c)"/>
+  <path class="ln-c" d="M575 88 V146" marker-end="url(#ar-c)"/>
+  <path class="ln-c" d="M690 88 V146" marker-end="url(#ar-c)"/>
+  <text class="sm" x="575" y="208" text-anchor="middle">每个 goroutine 捕获的都是自己那一轮的变量</text>
+</svg>
+<figcaption>图 3-3　循环变量与闭包：Go 1.22 修复了这个 Go 里「最常见的坑」</figcaption>
+</figure>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：循环变量每轮迭代都是新的 <span class="ver">Go 1.22+</span></div>
+  <p>
+    Go 1.22 修改了 <code>for</code> 循环的语义：用 <code>:=</code> 声明的循环变量<strong>每轮迭代都是一个新变量</strong>。
+    所以在 <code>go.mod</code> 声明 <code>go 1.22</code> 或更高的模块里，上面「错误」的版本也会正确打印三个不同的词（顺序不定）。
+    书中「把值作为参数传进去」的写法依然正确，但已经不再必要。注意这个行为由<strong>模块的 go 版本</strong>决定，而不是你安装的 Go 版本：
+    老模块升级时，可以用 <code>go vet</code> 的 <code>loopclosure</code> 检查或 <code>bisect</code> 工具排查受影响的代码。
+  </p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="新写法：Go 1.22+ 直接引用 + Go 1.25 的 wg.Go">
+<pre>
+var wg sync.WaitGroup
+for _, salutation := range []string{"hello", "greetings", "good day"} {
+	wg.Go(func() { // Go 1.25+：自动 Add(1)，函数返回时自动 Done()
+		fmt.Println(salutation) // 每轮迭代独立的变量，放心引用
+	})
+}
+wg.Wait()
+</pre>
+  </div>
+</div>
+
+<p>
+  因为 goroutine 共享地址空间、只是托管函数，使用 goroutine 是编写非并发代码的自然延伸。编译器会把变量「钉」在内存里，避免 goroutine 访问已释放的内存，
+  让你专注于问题本身。但这不是空白支票：多个 goroutine 可以操作同一块内存，我们仍然需要同步 —— 要么同步对共享内存的访问，要么用 CSP 原语通过通信来共享内存。
+</p>
+
+<h3 id="lightweight">goroutine 有多轻？</h3>
+
+<p>Go FAQ 里这样写：</p>
+
+<blockquote style="margin:16px 0;padding:10px 18px;border-left:3px solid var(--line-2);color:var(--fg-soft)">
+  新创建的 goroutine 只分配几 KB 的栈，这几乎总是够用的；不够时，运行时会自动增长（和收缩）栈。CPU 开销平均每次函数调用约三条廉价指令。
+  在同一地址空间里创建几十万个 goroutine 是现实可行的。如果 goroutine 只是线程，系统资源会在小得多的数量上耗尽。
+</blockquote>
+
+<p>
+  动手验证之前，先说一个重要事实：<strong>垃圾回收器不会回收被遗弃的 goroutine</strong>。如果写了下面这样的代码，这个 goroutine 会一直存在到进程退出：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+go func() {
+	// &lt;一个会永远阻塞的操作&gt;
+}()
+// 做其他事
+</pre>
+</div>
+
+<p>第 4 章「防止 goroutine 泄漏」会解决这个问题。这里正好利用它来测量 goroutine 的大小：</p>
+
+<div class="code" data-lang="go" data-file="goroutines/fig-goroutine-size.go">
+<pre>
+memConsumed := func() uint64 {
+	runtime.GC()
+	var s runtime.MemStats
+	runtime.ReadMemStats(&amp;s)
+	return s.Sys
+}
+
+var c &lt;-chan interface{}
+var wg sync.WaitGroup
+noop := func() { wg.Done(); &lt;-c } // ① 从 nil 通道读，永远阻塞，goroutine 不会退出
+
+const numGoroutines = 1e4 // ② 用大数定律逼近单个 goroutine 的大小
+wg.Add(numGoroutines)
+before := memConsumed() // ③ 创建前
+for i := numGoroutines; i &gt; 0; i-- {
+	go noop()
+}
+wg.Wait()
+after := memConsumed() // ④ 创建后
+fmt.Printf("%.3fkb", float64(after-before)/numGoroutines/1000)
+</pre>
+</div>
+
+<p>书中结果是 <code>2.817kb</code>，按此推算，8 GB 内存理论上能容纳几百万个 goroutine。在本笔记写作时用 Go 1.27 实测是 <code>2.55kb</code> 左右。</p>
+
+<p>
+  另一个可能让人担心的是<strong>上下文切换</strong>：并发进程切换时要保存状态、再加载另一个的状态。OS 线程切换要保存寄存器、查找表、内存映射等，代价不小。
+  软件定义的调度器可以更挑剔地决定保存什么、怎么保存、什么时候保存。书中用 Linux 的 <code>perf bench sched pipe</code> 测得线程切换约 1.467μs，
+  再用下面的基准测试测 goroutine：
+</p>
+
+<div class="code" data-lang="go" data-file="goroutines/fig-ctx-switch_test.go">
+<pre>
+func BenchmarkContextSwitch(b *testing.B) {
+	var wg sync.WaitGroup
+	begin := make(chan struct{})
+	c := make(chan struct{})
+
+	var token struct{}
+	sender := func() {
+		defer wg.Done()
+		&lt;-begin // ① 等发令枪，不把创建 goroutine 的开销算进来
+		for i := 0; i &lt; b.N; i++ {
+			c &lt;- token // ② struct{}{} 不占内存，只测「发信号」的开销
+		}
+	}
+	receiver := func() {
+		defer wg.Done()
+		&lt;-begin
+		for i := 0; i &lt; b.N; i++ {
+			&lt;-c // ③ 收到消息，什么都不做
+		}
+	}
+
+	wg.Add(2)
+	go sender()
+	go receiver()
+	b.StartTimer() // ④ 开始计时
+	close(begin)   // ⑤ 发令：两个 goroutine 同时开始
+	wg.Wait()
+}
+</pre>
+</div>
+
+<div class="code" data-lang="bash">
+<pre>
+$ go test -bench=. -cpu=1 fig-ctx-switch_test.go
+BenchmarkContextSwitch   5000000     225 ns/op     # 书中结果
+BenchmarkContextSwitch   7698033   147.7 ns/op     # 本笔记写作时，Go 1.27 实测
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 236" role="img" aria-label="OS 线程与 goroutine 的栈大小和上下文切换开销对比">
+  <text class="ttl" x="20" y="28">初始栈大小</text>
+  <text class="lbl" x="20" y="62">OS 线程</text>
+  <rect class="bx-r" x="120" y="46" width="520" height="24" rx="5"/>
+  <text class="sm on-r" x="650" y="63">常见 1–8 MB（预留）</text>
+  <text class="lbl" x="20" y="96">goroutine</text>
+  <rect class="bx-c" x="120" y="80" width="4" height="24" rx="2"/>
+  <text class="sm on-c" x="134" y="97">约 2 KB（按需增长 / 收缩）</text>
+
+  <text class="ttl" x="20" y="144">一次上下文切换（书中数据）</text>
+  <text class="lbl" x="20" y="178">OS 线程</text>
+  <rect class="bx-r" x="120" y="162" width="440" height="24" rx="5"/>
+  <text class="sm on-r" x="570" y="179">1.467 μs</text>
+  <text class="lbl" x="20" y="212">goroutine</text>
+  <rect class="bx-c" x="120" y="196" width="67" height="24" rx="5"/>
+  <text class="sm on-c" x="197" y="213">0.225 μs（Go 1.27 本机实测约 0.148 μs）</text>
+</svg>
+<figcaption>图 3-4　goroutine 的内存和切换成本都远低于线程（约快 92%）</figcaption>
+</figure>
+
+<div class="box key">
+  <div class="t">&#9733; goroutine 很便宜</div>
+  <p>
+    只要你的问题没有被阿姆达尔定律里的某个顺序段卡住，goroutine 越多，程序就越能利用多处理器扩展。
+    创建 goroutine 非常便宜，<strong>只有在你证明了它们是性能问题的根源时，才需要讨论它们的成本。</strong>
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="sync-pkg">sync 包</h2>
+
+<p>
+  <code>sync</code> 包包含了最适合底层内存访问同步的并发原语。如果你用过以内存同步为主的语言，这些类型会很眼熟。
+  不同的是，Go 在它们之上又构建了一套新的原语（通道等）。正如第 2 章所说，它们最适合用在<strong>小作用域</strong>里，比如一个结构体内部。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 140" role="img" aria-label="sync 包中各原语的用途">
+  <rect class="bx-g" x="10"  y="20" width="140" height="96" rx="10"/>
+  <text class="ttl on-g" x="80" y="46" text-anchor="middle">WaitGroup</text>
+  <text class="sm" x="80" y="70" text-anchor="middle">等一组 goroutine</text><text class="sm" x="80" y="88" text-anchor="middle">全部结束</text>
+  <rect class="bx-a" x="160" y="20" width="140" height="96" rx="10"/>
+  <text class="ttl on-a" x="230" y="46" text-anchor="middle">Mutex / RWMutex</text>
+  <text class="sm" x="230" y="70" text-anchor="middle">保护临界区</text><text class="sm" x="230" y="88" text-anchor="middle">（读写可分开）</text>
+  <rect class="bx-p" x="310" y="20" width="140" height="96" rx="10"/>
+  <text class="ttl on-p" x="380" y="46" text-anchor="middle">Cond</text>
+  <text class="sm" x="380" y="70" text-anchor="middle">等待 / 广播</text><text class="sm" x="380" y="88" text-anchor="middle">「某事发生了」</text>
+  <rect class="bx-b" x="460" y="20" width="140" height="96" rx="10"/>
+  <text class="ttl on-b" x="530" y="46" text-anchor="middle">Once</text>
+  <text class="sm" x="530" y="70" text-anchor="middle">函数只执行一次</text><text class="sm" x="530" y="88" text-anchor="middle">（如懒初始化）</text>
+  <rect class="bx-c" x="610" y="20" width="140" height="96" rx="10"/>
+  <text class="ttl on-c" x="680" y="46" text-anchor="middle">Pool</text>
+  <text class="sm" x="680" y="70" text-anchor="middle">复用临时对象</text><text class="sm" x="680" y="88" text-anchor="middle">减少分配</text>
+</svg>
+<figcaption>图 3-5　sync 包速览</figcaption>
+</figure>
+
+<h3 id="waitgroup">WaitGroup</h3>
+
+<p>
+  当你<strong>不关心</strong>并发操作的结果，或者有其他办法收集结果时，<code>WaitGroup</code> 是等待一组并发操作完成的好办法。
+  如果两个条件都不满足，作者建议改用通道和 <code>select</code>。
+</p>
+
+<div class="code" data-lang="go" data-file="waitgroup/fig-wait-group.go">
+<pre>
+var wg sync.WaitGroup
+
+wg.Add(1) // ① 一个 goroutine 要开始了
+go func() {
+	defer wg.Done() // ② 用 defer 保证退出前一定通知「我结束了」
+	fmt.Println("1st goroutine sleeping...")
+	time.Sleep(1)
+}()
+
+wg.Add(1)
+go func() {
+	defer wg.Done()
+	fmt.Println("2nd goroutine sleeping...")
+	time.Sleep(2)
+}()
+
+wg.Wait() // ③ 阻塞，直到所有 goroutine 都报告结束
+fmt.Println("All goroutines complete.")
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 170" role="img" aria-label="WaitGroup 计数器的变化过程">
+  <text class="lbl" x="20" y="24">WaitGroup 就是一个并发安全的计数器：</text>
+  <rect class="bx" x="26" y="44" width="100" height="60" rx="10"/>
+  <text class="sm" x="76" y="66" text-anchor="middle">初始</text><text class="ttl" x="76" y="92" text-anchor="middle">0</text>
+  <rect class="bx-a" x="178" y="44" width="100" height="60" rx="10"/>
+  <text class="sm" x="228" y="66" text-anchor="middle">一个在跑</text><text class="ttl on-a" x="228" y="92" text-anchor="middle">1</text>
+  <rect class="bx-a" x="330" y="44" width="100" height="60" rx="10"/>
+  <text class="sm" x="380" y="66" text-anchor="middle">两个在跑</text><text class="ttl on-a" x="380" y="92" text-anchor="middle">2</text>
+  <rect class="bx-g" x="482" y="44" width="100" height="60" rx="10"/>
+  <text class="sm" x="532" y="66" text-anchor="middle">还剩一个</text><text class="ttl on-g" x="532" y="92" text-anchor="middle">1</text>
+  <rect class="bx-g" x="634" y="44" width="100" height="60" rx="10"/>
+  <text class="sm" x="684" y="66" text-anchor="middle">全部结束</text><text class="ttl on-g" x="684" y="92" text-anchor="middle">0</text>
+  <path class="ln-a" d="M128 74 H174" marker-end="url(#ar-a)"/><text class="mono on-a" x="152" y="64" text-anchor="middle">Add(1)</text>
+  <path class="ln-a" d="M280 74 H326" marker-end="url(#ar-a)"/><text class="mono on-a" x="304" y="64" text-anchor="middle">Add(1)</text>
+  <path class="ln-g" d="M432 74 H478" marker-end="url(#ar-g)"/><text class="mono on-g" x="456" y="64" text-anchor="middle">Done()</text>
+  <path class="ln-g" d="M584 74 H630" marker-end="url(#ar-g)"/><text class="mono on-g" x="608" y="64" text-anchor="middle">Done()</text>
+  <path class="ln-d" d="M76 124 H684"/>
+  <text class="lbl" x="380" y="148" text-anchor="middle">在此期间 Wait() 一直阻塞；计数归零的那一刻，Wait() 返回</text>
+</svg>
+<figcaption>图 3-6　Add 加计数，Done 减一，Wait 阻塞到计数为零</figcaption>
+</figure>
+
+<div class="box warn">
+  <div class="t">&#9888; Add 必须在 goroutine 外面调用</div>
+  <p>
+    注意 <code>Add</code> 是在它要跟踪的 goroutine <strong>之外</strong>调用的。如果放进 goroutine 里，就引入了竞态：
+    我们无法保证 goroutine 什么时候被调度，可能在任何一个 <code>Add</code> 执行之前就走到了 <code>Wait</code>，于是 <code>Wait</code> 直接返回，根本没等。
+  </p>
+</div>
+
+<p>习惯上 <code>Add</code> 尽量紧挨着它跟踪的 goroutine，但有时也会在循环前一次性加好：</p>
+
+<div class="code" data-lang="go" data-file="waitgroup/fig-bulk-add.go">
+<pre>
+hello := func(wg *sync.WaitGroup, id int) {
+	defer wg.Done()
+	fmt.Printf("Hello from %v!\n", id)
+}
+
+const numGreeters = 5
+var wg sync.WaitGroup
+wg.Add(numGreeters) // 一次性加 5
+for i := 0; i &lt; numGreeters; i++ {
+	go hello(&amp;wg, i+1)
+}
+wg.Wait()
+</pre>
+</div>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：<code>wg.Go</code> 与 vet 检查 <span class="ver">Go 1.25+</span></div>
+  <p>
+    Go 1.25 给 <code>WaitGroup</code> 加了 <code>Go(f func())</code> 方法：它在新 goroutine 里运行 <code>f</code>，自动完成 <code>Add(1)</code> 和 <code>Done()</code>，
+    从结构上消除了「忘记 Done」「Add 放错位置」两类 bug。同时 <code>go vet</code> 新增了 <code>waitgroup</code> 检查，
+    会对「在新 goroutine 里调用 <code>wg.Add</code>」报错：<code>WaitGroup.Add called from inside new goroutine</code>。
+  </p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="新写法">
+<pre>
+var wg sync.WaitGroup
+for i := range 5 { // Go 1.22+：可以 range 一个整数
+	wg.Go(func() {
+		fmt.Printf("Hello from %v!\n", i+1)
+	})
+}
+wg.Wait()
+</pre>
+  </div>
+  <p>如果 goroutine 可能出错、需要收集第一个错误或出错时取消其他任务，用 <code>golang.org/x/sync/errgroup</code>（第 5 章会再提到）。</p>
+</div>
+
+<h3 id="mutex">Mutex 和 RWMutex</h3>
+
+<p>
+  <code>Mutex</code> 是「mutual exclusion（互斥）」的缩写，用来保护程序的临界区。借用 Go 的说法：通道通过通信来共享内存，
+  而 <code>Mutex</code> 通过<strong>开发者必须遵守的约定</strong>来共享内存 —— 你负责用锁守住对内存的访问。
+</p>
+
+<div class="code" data-lang="go" data-file="mutex-&amp;-rwmutex/fig-mutex.go">
+<pre>
+var count int
+var lock sync.Mutex
+
+increment := func() {
+	lock.Lock()         // ① 请求独占 count 这个临界区
+	defer lock.Unlock() // ② 用完释放
+	count++
+	fmt.Printf("Incrementing: %d\n", count)
+}
+
+decrement := func() {
+	lock.Lock()
+	defer lock.Unlock()
+	count--
+	fmt.Printf("Decrementing: %d\n", count)
+}
+
+// 增加
+var arithmetic sync.WaitGroup
+for i := 0; i &lt;= 5; i++ {
+	arithmetic.Add(1)
+	go func() {
+		defer arithmetic.Done()
+		increment()
+	}()
+}
+
+// 减少
+for i := 0; i &lt;= 5; i++ {
+	arithmetic.Add(1)
+	go func() {
+		defer arithmetic.Done()
+		decrement()
+	}()
+}
+
+arithmetic.Wait()
+fmt.Println("Arithmetic complete.")
+</pre>
+</div>
+
+<p>
+  输出的中间值顺序不定，但最后一定回到 0。注意 <code>Unlock</code> 总是放在 <code>defer</code> 里 ——
+  这是使用 <code>Mutex</code> 的惯用法，保证即使发生 panic 也一定会解锁。忘了解锁，程序多半会死锁。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：<code>defer</code> 几乎零开销 <span class="ver">Go 1.14+</span></div>
+  <p>
+    早年有人为了性能在热点路径上避免 <code>defer Unlock()</code>。Go 1.14 引入了「开放编码的 defer」，大多数情况下 <code>defer</code> 的开销已接近直接调用，
+    请放心使用 <code>defer mu.Unlock()</code>。另外 Go 1.18 加了 <code>TryLock</code>，但官方文档明确说「正确使用它的场景很少见」，通常意味着设计有问题。
+  </p>
+</div>
+
+<p>
+  临界区之所以叫「临界」，是因为它们反映了程序的瓶颈：进出临界区有一定开销，所以大家都想尽量缩短在临界区里的时间。
+  一种策略是<strong>缩小临界区的「截面」</strong>：也许很多并发进程都要访问某块内存，但并不是所有人都要写。这时可以用 <code>sync.RWMutex</code>：
+  <strong>可以同时有任意多个读者持有读锁，只要没有人持有写锁</strong>。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="RWMutex：多个读者可以同时读，写者需要独占">
+  <text class="ttl on-g" x="185" y="26" text-anchor="middle">读锁 RLock：大家一起读</text>
+  <text class="ttl on-r" x="575" y="26" text-anchor="middle">写锁 Lock：一个人独占</text>
+  <path class="ln-d" d="M380 14 V206"/>
+  <rect class="bx-g" x="125" y="120" width="120" height="50" rx="10"/>
+  <text class="mono on-g" x="185" y="150" text-anchor="middle">共享数据</text>
+  <circle class="dot-b" cx="60" cy="60" r="15"/><text class="sm" x="60" y="64" text-anchor="middle" style="fill:#fff">R1</text>
+  <circle class="dot-b" cx="125" cy="60" r="15"/><text class="sm" x="125" y="64" text-anchor="middle" style="fill:#fff">R2</text>
+  <circle class="dot-b" cx="245" cy="60" r="15"/><text class="sm" x="245" y="64" text-anchor="middle" style="fill:#fff">R3</text>
+  <circle class="dot-b" cx="310" cy="60" r="15"/><text class="sm" x="310" y="64" text-anchor="middle" style="fill:#fff">R4</text>
+  <path class="ln-g" d="M70 72 L140 116 M128 76 L165 116 M242 76 L205 116 M300 72 L230 116"/>
+  <text class="sm" x="185" y="196" text-anchor="middle">读者之间互不阻塞</text>
+
+  <rect class="bx-r" x="515" y="120" width="120" height="50" rx="10"/>
+  <text class="mono on-r" x="575" y="150" text-anchor="middle">共享数据</text>
+  <circle class="dot-p" cx="575" cy="60" r="15"/><text class="sm" x="575" y="64" text-anchor="middle" style="fill:#fff">W</text>
+  <path class="ln-p" d="M575 76 V116" marker-end="url(#ar-p)"/>
+  <circle class="dot-f" cx="440" cy="60" r="13"/><text class="sm" x="440" y="64" text-anchor="middle" style="fill:#fff">R</text>
+  <circle class="dot-f" cx="700" cy="60" r="13"/><text class="sm" x="700" y="64" text-anchor="middle" style="fill:#fff">R</text>
+  <text class="sm" x="440" y="94" text-anchor="middle">等待</text>
+  <text class="sm" x="700" y="94" text-anchor="middle">等待</text>
+  <text class="sm" x="575" y="196" text-anchor="middle">写的时候，其他读者和写者都要等</text>
+</svg>
+<figcaption>图 3-7　RWMutex：读多写少时能显著减少等待</figcaption>
+</figure>
+
+<p>书中用一个基准对比了两者：一个不太活跃的生产者（写者）和越来越多的观察者（读者）。</p>
+
+<div class="code" data-lang="go" data-file="mutex-&amp;-rwmutex/fig-rwlock.go（节选）">
+<pre>
+producer := func(wg *sync.WaitGroup, l sync.Locker) { // ① sync.Locker 接口：Lock() 和 Unlock()
+	defer wg.Done()
+	for i := 5; i &gt; 0; i-- {
+		l.Lock()
+		l.Unlock()
+		time.Sleep(1) // ② 让生产者比观察者更「懒」一些
+	}
+}
+
+observer := func(wg *sync.WaitGroup, l sync.Locker) {
+	defer wg.Done()
+	l.Lock()
+	defer l.Unlock()
+}
+
+test := func(count int, mutex, rwMutex sync.Locker) time.Duration {
+	var wg sync.WaitGroup
+	wg.Add(count + 1)
+	beginTestTime := time.Now()
+	go producer(&amp;wg, mutex)
+	for i := count; i &gt; 0; i-- {
+		go observer(&amp;wg, rwMutex)
+	}
+	wg.Wait()
+	return time.Since(beginTestTime)
+}
+
+var m sync.RWMutex
+// test(count, &amp;m, m.RLocker())  ← 观察者用读锁
+// test(count, &amp;m, &amp;m)           ← 观察者也用写锁（相当于普通 Mutex）
+</pre>
+</div>
+
+<div class="tw">
+<table>
+  <tr><th>读者数</th><th>RWMutex</th><th>Mutex</th></tr>
+  <tr><td>1</td><td>38.3µs</td><td>15.9µs</td></tr>
+  <tr><td>64</td><td>141.7µs</td><td>163.4µs</td></tr>
+  <tr><td>1024</td><td>1.68ms</td><td>2.42ms</td></tr>
+  <tr><td>8192</td><td>9.24ms</td><td>16.25ms</td></tr>
+  <tr><td>131072</td><td>158.8ms</td><td>119.6ms</td></tr>
+  <tr><td>524288</td><td>303.9ms</td><td>231.1ms</td></tr>
+</table>
+</div>
+
+<p>
+  （节选自书中输出。）在这个例子里，缩小临界区截面的收益大约在 2<sup>13</sup> 个读者左右才开始显现 —— 这依赖于临界区具体在做什么。
+  作者的建议是：<strong>逻辑上说得通时，通常优先用 <code>RWMutex</code> 而不是 <code>Mutex</code></strong>。
+</p>
+
+<div class="box tip">
+  <div class="t">&#10003; 补充：读多写少的 map 可以看看 sync.Map <span class="ver">Go 1.9+</span></div>
+  <p>
+    书中没有提到的 <code>sync.Map</code> 适合两种场景：键只写一次、读很多次（如缓存）；或多个 goroutine 读写<strong>互不相交</strong>的键。
+    其他情况下，普通 map 加 <code>Mutex</code>/<code>RWMutex</code> 往往更简单、类型更安全。Go 1.24 用新的并发哈希树重写了 <code>sync.Map</code>，性能有明显提升。
+  </p>
+</div>
+
+<h3 id="cond">Cond</h3>
+
+<p><code>Cond</code> 类型的注释很好地概括了它的用途：</p>
+<blockquote style="margin:16px 0;padding:10px 18px;border-left:3px solid var(--line-2);color:var(--fg-soft)">
+  ……一个让 goroutine 等待某个事件发生、或宣布某个事件发生的会合点。
+</blockquote>
+
+<p>
+  这里的「事件」是两个或多个 goroutine 之间的任意信号，除了「它发生了」之外不携带任何信息。经常需要等某个信号再继续执行。
+  不用 <code>Cond</code> 的话，一种天真的写法是死循环：
+</p>
+
+<div class="vs">
+  <div class="old"><div class="h">✗ 忙等：吃满一个核</div>
+<div class="code" data-lang="go"><pre>
+for conditionTrue() == false {
+}
+</pre></div></div>
+  <div class="old"><div class="h">✗ 睡一会儿：睡多久？</div>
+<div class="code" data-lang="go"><pre>
+for conditionTrue() == false {
+	time.Sleep(1 * time.Millisecond)
+}
+</pre></div></div>
+</div>
+
+<p>
+  后者好一些，但仍然低效，而且得猜睡多久：太久会人为降低性能，太短又浪费 CPU。更好的办法是让 goroutine 高效地睡着，直到被通知醒来检查条件 ——
+  这正是 <code>Cond</code> 做的事：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+c := sync.NewCond(&amp;sync.Mutex{}) // ① NewCond 接受一个满足 sync.Locker 接口的值
+c.L.Lock()                        // ② 必须先加锁：Wait 进入时会自动 Unlock
+for conditionTrue() == false {
+	c.Wait()                      // ③ 挂起当前 goroutine，等待通知
+}
+c.L.Unlock()                      // ④ 必须解锁：Wait 返回时会自动重新 Lock
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="Cond.Wait 内部隐藏的解锁和加锁步骤">
+  <rect class="bx-a" x="20" y="60" width="110" height="44" rx="8"/><text class="mono on-a" x="75" y="87" text-anchor="middle">c.L.Lock()</text>
+  <path class="ln" d="M132 82 H160" marker-end="url(#ar)"/>
+  <rect class="bx-d" x="164" y="30" width="430" height="104" rx="12"/>
+  <text class="ttl" x="379" y="52" text-anchor="middle">c.Wait() 内部（隐藏的副作用）</text>
+  <rect class="bx-g" x="180" y="66" width="120" height="44" rx="8"/><text class="mono on-g" x="240" y="93" text-anchor="middle">自动 Unlock</text>
+  <path class="ln" d="M302 88 H324" marker-end="url(#ar)"/>
+  <rect class="bx-p" x="328" y="66" width="110" height="44" rx="8"/><text class="sm on-p" x="383" y="86" text-anchor="middle">挂起，让出线程</text><text class="sm" x="383" y="102" text-anchor="middle">等 Signal/Broadcast</text>
+  <path class="ln" d="M440 88 H462" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="466" y="66" width="116" height="44" rx="8"/><text class="mono on-a" x="524" y="93" text-anchor="middle">自动 Lock</text>
+  <path class="ln" d="M596 82 H624" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="628" y="60" width="116" height="44" rx="8"/><text class="mono on-g" x="686" y="87" text-anchor="middle">c.L.Unlock()</text>
+  <text class="lbl" x="380" y="170" text-anchor="middle">看起来整个等待期间都拿着锁，其实没有 —— 读代码时要留意这个模式</text>
+</svg>
+<figcaption>图 3-8　Wait 进入时解锁、返回时加锁</figcaption>
+</figure>
+
+<p>
+  这种方式高效得多：<code>Wait</code> 不只是阻塞，而是<strong>挂起</strong>当前 goroutine，让其他 goroutine 可以在这个 OS 线程上运行。
+  作者坦言这个「隐藏的副作用」需要时间适应。
+</p>
+
+<p>来看收发两端都有的例子：一个固定长度为 2 的队列，要放入 10 个元素，一有空位就立刻放：</p>
+
+<div class="code" data-lang="go" data-file="cond/fig-cond-based-queue.go">
+<pre>
+c := sync.NewCond(&amp;sync.Mutex{})    // ① 用普通 Mutex 作为 Locker
+queue := make([]interface{}, 0, 10) // ② 长度 0、容量 10 的切片
+
+removeFromQueue := func(delay time.Duration) {
+	time.Sleep(delay)
+	c.L.Lock()        // ⑧ 再次进入临界区，修改与条件相关的数据
+	queue = queue[1:] // ⑨ 模拟出队
+	fmt.Println("Removed from queue")
+	c.L.Unlock()      // ⑩ 离开临界区
+	c.Signal()        // ⑪ 通知一个正在等待的 goroutine：有事发生了
+}
+
+for i := 0; i &lt; 10; i++ {
+	c.L.Lock()            // ③ 进入临界区
+	for len(queue) == 2 { // ④ 必须在循环里检查！收到信号只代表「有事发生」，不代表你等的条件已满足
+		c.Wait()          // ⑤ 挂起主 goroutine，等信号
+	}
+	fmt.Println("Adding to queue")
+	queue = append(queue, struct{}{})
+	go removeFromQueue(1 * time.Second) // ⑥ 1 秒后出队一个元素
+	c.L.Unlock()                        // ⑦ 入队成功，离开临界区
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="基于 Cond 的队列：满了就 Wait，出队后 Signal">
+  <text class="lbl" x="20" y="24">队列长度随时间的变化（容量上限 2）</text>
+  <path class="ln" d="M60 170 H730" marker-end="url(#ar)"/>
+  <path class="ln" d="M60 170 V40"/>
+  <text class="sm" x="50" y="174" text-anchor="end">0</text>
+  <text class="sm" x="50" y="124" text-anchor="end">1</text>
+  <text class="sm" x="50" y="74" text-anchor="end">2</text>
+  <path class="ln-r" style="stroke-dasharray:4 4" d="M60 70 H720"/>
+  <text class="sm on-r" x="726" y="66" text-anchor="end">满</text>
+  <path class="ln-a" d="M60 170 H80 V120 H100 V70 H220 V120 H232 V70 H350 V120 H362 V70 H480 V120 H492 V70 H610 V120 H622 V70 H700"/>
+  <text class="sm on-a" x="90" y="110" text-anchor="middle">入</text>
+  <text class="sm on-a" x="110" y="62">入</text>
+  <text class="sm on-p" x="160" y="92" text-anchor="middle">Wait…</text>
+  <text class="sm on-g" x="220" y="140" text-anchor="middle">出→Signal</text>
+  <text class="sm on-a" x="232" y="62" text-anchor="middle">入</text>
+  <text class="sm on-p" x="290" y="92" text-anchor="middle">Wait…</text>
+  <text class="sm on-g" x="350" y="140" text-anchor="middle">出→Signal</text>
+  <text class="sm on-p" x="420" y="92" text-anchor="middle">Wait…</text>
+  <text class="sm on-p" x="550" y="92" text-anchor="middle">Wait…</text>
+  <text class="sm" x="395" y="196" text-anchor="middle">时间 → 　每出队一个，主 goroutine 就被唤醒，补进一个</text>
+</svg>
+<figcaption>图 3-9　队列先装满 2 个，之后总是「出一个、进一个」</figcaption>
+</figure>
+
+<p>
+  这里出现了 <code>Signal</code>，它是通知 <code>Wait</code> 中 goroutine 的两个方法之一，另一个是 <code>Broadcast</code>。
+  运行时内部维护了一个等待者的 FIFO 列表：<strong><code>Signal</code> 唤醒等待最久的那一个；<code>Broadcast</code> 唤醒所有等待者</strong>。
+  用通道很容易模拟 <code>Signal</code>，但要模拟「反复 Broadcast」就难了；而且 <code>Cond</code> 的性能比通道好得多。
+</p>
+
+<p>想象一个带按钮的 GUI 程序，我们想注册任意多个函数，按钮被点击时全部执行。<code>Broadcast</code> 再合适不过：</p>
+
+<div class="code" data-lang="go" data-file="cond/fig-cond-broadcast.go">
+<pre>
+type Button struct { // ① Button 包含一个条件 Clicked
+	Clicked *sync.Cond
+}
+button := Button{Clicked: sync.NewCond(&amp;sync.Mutex{})}
+
+subscribe := func(c *sync.Cond, fn func()) { // ② 每个处理函数跑在自己的 goroutine 里
+	var goroutineRunning sync.WaitGroup
+	goroutineRunning.Add(1)
+	go func() {
+		goroutineRunning.Done()
+		c.L.Lock()
+		defer c.L.Unlock()
+		c.Wait()
+		fn()
+	}()
+	goroutineRunning.Wait() // 确认 goroutine 已经跑起来才返回
+}
+
+var clickRegistered sync.WaitGroup // ③ 只为了保证程序不在输出前退出
+clickRegistered.Add(3)
+subscribe(button.Clicked, func() { // ④ 模拟最大化窗口
+	fmt.Println("Maximizing window.")
+	clickRegistered.Done()
+})
+subscribe(button.Clicked, func() { // ⑤ 模拟弹出对话框
+	fmt.Println("Displaying annoying dialog box!")
+	clickRegistered.Done()
+})
+subscribe(button.Clicked, func() { // ⑥ 模拟鼠标点击
+	fmt.Println("Mouse clicked.")
+	clickRegistered.Done()
+})
+
+button.Clicked.Broadcast() // ⑦ 模拟用户松开鼠标：一次通知所有处理函数
+clickRegistered.Wait()
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出（顺序不定）">
+<pre>
+Mouse clicked.
+Maximizing window.
+Displaying annoying dialog box!
+</pre>
+</div>
+
+<p>
+  和 <code>sync</code> 包里大多数东西一样，<code>Cond</code> 最好用在<strong>很小的作用域</strong>里，或者被一个类型封装起来再暴露给更大的范围。
+</p>
+
+<div class="box deep">
+  <div class="t">&#128270; 现实中 Cond 用得并不多</div>
+  <p>
+    实践中，很多 Go 开发者更倾向于用通道表达「事件」：一次性的事件用 <code>close(ch)</code> 广播（本章「通道」一节会讲），
+    需要携带数据就发送值。<code>Cond</code> 的一个难点是它<strong>不能和 <code>select</code>、超时、<code>context</code> 取消组合</strong>。
+    如果非用不可，可以借助 Go 1.21 的 <code>context.AfterFunc</code> 在 context 取消时 <code>Broadcast</code> 唤醒等待者（标准库文档中有示例）。
+  </p>
+</div>
+
+<h3 id="once">Once</h3>
+
+<p>猜猜这段代码会输出什么？</p>
+
+<div class="code" data-lang="go" data-file="once/fig-sync-once.go">
+<pre>
+var count int
+increment := func() {
+	count++
+}
+
+var once sync.Once
+
+var increments sync.WaitGroup
+increments.Add(100)
+for i := 0; i &lt; 100; i++ {
+	go func() {
+		defer increments.Done()
+		once.Do(increment)
+	}()
+}
+
+increments.Wait()
+fmt.Printf("Count is %d\n", count) // Count is 1
+</pre>
+</div>
+
+<p>
+  输出 <code>Count is 1</code>。<code>sync.Once</code> 内部用了一些同步原语，确保即使在不同 goroutine 上，<strong>对 <code>Do</code> 的调用只有一次会真正执行传入的函数</strong>。
+  这个需求出奇地常见：书中用 <code>grep -ir sync.Once $(go env GOROOT)/src | wc -l</code> 统计，Go 1.8 的标准库里出现了 70 次；
+  本笔记写作时在 Go 1.27 上再跑一次，已经是 305 次。
+</p>
+
+<p>两个需要注意的地方。第一，看这个例子：</p>
+
+<div class="code" data-lang="go" data-file="once/fig-sync-once-diff-funcs.go">
+<pre>
+var count int
+increment := func() { count++ }
+decrement := func() { count-- }
+
+var once sync.Once
+once.Do(increment)
+once.Do(decrement)
+
+fmt.Printf("Count: %d\n", count) // Count: 1
+</pre>
+</div>
+
+<p>
+  结果是 1 而不是 0：<strong><code>sync.Once</code> 只统计 <code>Do</code> 被调用了几次，不管传进去的是哪个函数</strong>。
+  所以一个 <code>Once</code> 和它要调用的函数是紧密绑定的。作者建议把 <code>Once</code> 的使用包在一个小的词法块里：一个小函数，或者和函数一起封装进一个类型。
+</p>
+
+<p>第二，这个例子会怎样？</p>
+
+<div class="code" data-lang="go" data-file="once/fig-sync-once-do-deadlock.go">
+<pre>
+var onceA, onceB sync.Once
+var initB func()
+initA := func() { onceB.Do(initB) }
+initB = func() { onceA.Do(initA) } // ① 这个调用要等 ② 返回才能继续
+onceA.Do(initA)                    // ②
+</pre>
+</div>
+
+<p>
+  <strong>死锁</strong>：① 处的 <code>Do</code> 要等 ② 处的 <code>Do</code> 退出，而 ② 又在等 ①。
+  看起来我们在按预期用 <code>Once</code> 防止重复初始化，但 <code>Once</code> 唯一保证的是「函数只调用一次」——
+  有时它是通过让程序死锁、暴露你的逻辑缺陷（这里是循环引用）来做到的。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：OnceFunc / OnceValue / OnceValues <span class="ver">Go 1.21+</span></div>
+  <p>
+    作者建议「把 Once 和函数封装在一起」，Go 1.21 直接把这个建议做进了标准库：
+  </p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="新写法">
+<pre>
+// 返回一个「只会执行一次」的函数，Once 和函数天然绑定在一起
+initLogger := sync.OnceFunc(func() { /* ... */ })
+
+// 懒加载一个值：第一次调用时计算，之后直接返回缓存结果
+loadConfig := sync.OnceValue(func() *Config { return parseConfig() })
+cfg := loadConfig()
+
+// 带错误返回的版本
+readKey := sync.OnceValues(func() ([]byte, error) {
+	return os.ReadFile("key.pem")
+})
+key, err := readKey()
+</pre>
+  </div>
+  <p>还有一个区别：如果函数 panic，<code>OnceFunc</code> 返回的函数在之后每次调用时都会以同样的值重新 panic，而 <code>sync.Once.Do</code> 之后的调用则静默地什么都不做。</p>
+</div>
+
+<h3 id="pool">Pool</h3>
+
+<p>
+  <code>Pool</code> 是<strong>对象池模式</strong>的并发安全实现。对象池是一种创建并提供固定数量（池）的东西以供使用的方式，
+  常用于限制昂贵事物（如数据库连接）的创建数量。Go 的 <code>sync.Pool</code> 可以被多个 goroutine 安全使用。
+  它的主要接口是 <code>Get</code>：先看池里有没有可用实例，有就返回，没有就调用 <code>New</code> 创建一个。用完后调用 <code>Put</code> 放回去。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="sync.Pool 的 Get、Put、New 流程">
+  <rect class="bx-c" x="280" y="40" width="200" height="120" rx="14"/>
+  <text class="ttl on-c" x="380" y="64" text-anchor="middle">sync.Pool</text>
+  <rect class="bx" x="304" y="80" width="40" height="30" rx="6"/>
+  <rect class="bx" x="352" y="80" width="40" height="30" rx="6"/>
+  <rect class="bx-d" x="400" y="80" width="40" height="30" rx="6"/>
+  <text class="sm" x="380" y="140" text-anchor="middle">闲置的对象</text>
+
+  <circle class="dot-b" cx="80" cy="70" r="18"/><text class="sm" x="80" y="74" text-anchor="middle" style="fill:#fff">G</text>
+  <path class="ln-b" d="M276 80 H104" marker-end="url(#ar-b)"/>
+  <text class="mono on-b" x="190" y="72" text-anchor="middle">Get()：有就拿走</text>
+  <path class="ln-g" d="M104 130 H276" marker-end="url(#ar-g)"/>
+  <text class="mono on-g" x="190" y="150" text-anchor="middle">Put(x)：用完放回</text>
+  <circle class="dot-b" cx="80" cy="130" r="18"/><text class="sm" x="80" y="134" text-anchor="middle" style="fill:#fff">G</text>
+
+  <rect class="bx-a" x="560" y="70" width="170" height="56" rx="10"/>
+  <text class="mono on-a" x="645" y="94" text-anchor="middle">New()</text>
+  <text class="sm" x="645" y="114" text-anchor="middle">池空了才调用，新建一个</text>
+  <path class="ln-a" d="M558 98 H484" marker-end="url(#ar-a)"/>
+  <text class="lbl" x="380" y="194" text-anchor="middle">GC 可能随时清空池子 —— Pool 是「缓存」，不是「存储」</text>
+</svg>
+<figcaption>图 3-10　Pool：Get 优先复用，空了才 New；用完 Put 回去</figcaption>
+</figure>
+
+<div class="code" data-lang="go" data-file="pool/fig-sync-pool-basic.go">
+<pre>
+myPool := &amp;sync.Pool{
+	New: func() interface{} {
+		fmt.Println("Creating new instance.")
+		return struct{}{}
+	},
+}
+
+myPool.Get()             // ① 池是空的，调用 New
+instance := myPool.Get() // ① 还是空的，再调用一次 New
+myPool.Put(instance)     // ② 放回一个，池里有 1 个可用实例
+myPool.Get()             // ③ 复用刚放回的实例，不调用 New
+</pre>
+</div>
+
+<p>
+  输出两行 <code>Creating new instance.</code>。为什么要用池，而不是随用随建？Go 有垃圾回收，对象会被自动清理。看这个例子：
+</p>
+
+<div class="code" data-lang="go" data-file="pool/fig-sync-pool.go">
+<pre>
+var numCalcsCreated int
+calcPool := &amp;sync.Pool{
+	New: func() interface{} {
+		numCalcsCreated += 1
+		mem := make([]byte, 1024)
+		return &amp;mem // ① 存的是切片的地址
+	},
+}
+
+// 先往池里预存 4KB
+calcPool.Put(calcPool.New())
+calcPool.Put(calcPool.New())
+calcPool.Put(calcPool.New())
+calcPool.Put(calcPool.New())
+
+const numWorkers = 1024 * 1024
+var wg sync.WaitGroup
+wg.Add(numWorkers)
+for i := numWorkers; i &gt; 0; i-- {
+	go func() {
+		defer wg.Done()
+		mem := calcPool.Get().(*[]byte) // ② 断言类型为 *[]byte
+		defer calcPool.Put(mem)
+		// 假设这里用这块内存快速地做了些有趣的事
+	}()
+}
+
+wg.Wait()
+fmt.Printf("%d calculators were created.", numCalcsCreated)
+</pre>
+</div>
+
+<p>
+  输出 <code>8 calculators were created.</code>（结果不确定）。不用 <code>Pool</code> 的话，最坏情况下可能要分配 1GB 内存（一百万个 goroutine 各 1KB），
+  而这里只分配了约 8KB。
+</p>
+
+<div class="box warn">
+  <div class="t">&#9888; 书中这个例子有数据竞争</div>
+  <p>
+    <code>New</code> 会被多个 goroutine 并发调用，而 <code>numCalcsCreated += 1</code> 没有任何同步。用 <code>go run -race</code> 运行会报告 <code>DATA RACE</code>。
+    （竞态检测模式下 <code>Pool</code> 还会故意随机丢弃对象以暴露 bug，所以打印的数字会大得多。）这正呼应了本节后面的规则：<strong>传给 <code>New</code> 的函数必须是并发安全的</strong>。修正方式：
+  </p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="修正：用原子计数">
+<pre>
+var numCalcsCreated atomic.Int64
+calcPool := &amp;sync.Pool{
+	New: func() any { // Go 1.18+：any 是 interface{} 的别名
+		numCalcsCreated.Add(1)
+		mem := make([]byte, 1024)
+		return &amp;mem
+	},
+}
+</pre>
+  </div>
+</div>
+
+<p>
+  <code>Pool</code> 的另一个常见用途是<strong>预热</strong>一批预先分配好的对象，供必须尽快完成的操作使用。这时不是为了节省宿主机内存，
+  而是把「获取对象的时间」提前支付，为调用者节省时间。这在高吞吐网络服务里很常见。书中模拟了一个「连接到某个服务需要 1 秒」的场景：
+</p>
+
+<div class="code" data-lang="go" data-file="pool/fig-benchmark-fast-network-service_test.go（节选）">
+<pre>
+func connectToService() interface{} {
+	time.Sleep(1 * time.Second) // 建立连接很慢
+	return struct{}{}
+}
+
+func warmServiceConnCache() *sync.Pool {
+	p := &amp;sync.Pool{
+		New: connectToService,
+	}
+	for i := 0; i &lt; 10; i++ {
+		p.Put(p.New()) // 启动时预先建立 10 个连接
+	}
+	return p
+}
+
+// 在网络守护进程的循环里：
+for {
+	conn, err := server.Accept()
+	if err != nil {
+		log.Printf("cannot accept connection: %v", err)
+		continue
+	}
+	svcConn := connPool.Get() // 从池里拿，而不是现场 connectToService()
+	fmt.Fprintln(conn, "")
+	connPool.Put(svcConn)
+	conn.Close()
+}
+</pre>
+</div>
+
+<div class="tw">
+<table>
+  <tr><th>版本</th><th>每次请求耗时</th></tr>
+  <tr><td>每个请求现场建立连接</td><td>1,000,385,643 ns/op（约 1 秒）</td></tr>
+  <tr><td>从预热好的 Pool 取连接</td><td>2,904,307 ns/op（约 2.9 毫秒，快了三个数量级）</td></tr>
+</table>
+</div>
+
+<div class="box key">
+  <div class="t">&#9733; 使用 Pool 的四条规则</div>
+  <ul>
+    <li>实例化 <code>sync.Pool</code> 时，提供的 <code>New</code> 必须是<strong>并发安全</strong>的。</li>
+    <li>从 <code>Get</code> 拿到的实例，<strong>不要对它的状态做任何假设</strong>（可能是新建的，也可能是别人用过的）。</li>
+    <li>用完一定要 <code>Put</code> 回去，否则池就没用了。通常用 <code>defer</code>。</li>
+    <li>池里的对象应该<strong>大致同质</strong>。如果需要长度随机变化的切片，拿到合适长度的概率很低，池帮不上什么忙，转换的开销可能比新建还大。</li>
+  </ul>
+</div>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：关于 Pool 的几点更新</div>
+  <ul>
+    <li><span class="ver">Go 1.13+</span> 池里的对象不会在一次 GC 后全部丢失，而是先进入「受害者缓存」，要连续两次 GC 都没被用到才会被回收，GC 后的性能抖动小了很多。</li>
+    <li>真正的<strong>连接池</strong>（数据库连接等）一般不用 <code>sync.Pool</code>：GC 可能随时清空它，而且它不负责关闭连接。<code>database/sql</code> 自带连接池，HTTP 客户端由 <code>http.Transport</code> 管理连接复用。<code>sync.Pool</code> 最适合 <code>bytes.Buffer</code> 这类临时缓冲区。</li>
+    <li>书中用到的 <code>ioutil.ReadAll</code> 自 Go 1.16 起已弃用，请用 <code>io.ReadAll</code>。</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="channels">通道（channel）</h2>
+
+<p>
+  通道是 Go 从 Hoare 的 CSP 里继承来的同步原语。它可以用来同步内存访问，但<strong>最适合用来在 goroutine 之间传递信息</strong>。
+  通道可以组合，这让它在任何规模的程序里都非常有用。
+</p>
+
+<p>
+  像一条河一样，通道是信息流的管道：值沿着通道传递，在下游被读出。所以作者习惯给通道变量起名为 <code>xxxStream</code>。
+  程序的不同部分不需要了解彼此，只需要持有同一个通道的引用。
+</p>
+
+<h3 id="ch-basics">声明、方向和类型</h3>
+
+<div class="code" data-lang="go">
+<pre>
+var dataStream chan interface{}      // ① 声明一个通道，元素类型是空接口（可以放任何值）
+dataStream = make(chan interface{})  // ② 用内建的 make 创建
+</pre>
+</div>
+
+<p>通道也可以声明为<strong>单向</strong>的 —— 只能发送或只能接收。<code>&lt;-</code> 写在 <code>chan</code> 左边是只读，写在右边是只写：</p>
+
+<div class="vs">
+  <div class="new"><div class="h">只能接收（只读）</div>
+<div class="code" data-lang="go"><pre>
+var dataStream &lt;-chan interface{}
+dataStream := make(&lt;-chan interface{})
+</pre></div></div>
+  <div class="new"><div class="h">只能发送（只写）</div>
+<div class="code" data-lang="go"><pre>
+var dataStream chan&lt;- interface{}
+dataStream := make(chan&lt;- interface{})
+</pre></div></div>
+</div>
+
+<p>
+  很少直接创建单向通道，但它们常用作<strong>函数参数和返回类型</strong>。Go 会在需要时把双向通道<strong>隐式转换</strong>为单向通道：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+var receiveChan &lt;-chan interface{}
+var sendChan chan&lt;- interface{}
+dataStream := make(chan interface{})
+
+// 合法：双向 → 单向
+receiveChan = dataStream
+sendChan = dataStream
+</pre>
+</div>
+
+<p>通道是有类型的。<code>chan interface{}</code> 可以放任何数据，但通常应该用更严格的类型，比如 <code>intStream := make(chan int)</code>。</p>
+
+<h3 id="ch-send-recv">发送、接收与阻塞</h3>
+
+<p>
+  发送时 <code>&lt;-</code> 在通道右边，接收时在通道左边。可以理解为：<strong>数据沿着箭头的方向流动</strong>。
+</p>
+
+<div class="code" data-lang="go" data-file="channels/fig-simple-chan.go">
+<pre>
+stringStream := make(chan string)
+go func() {
+	stringStream &lt;- "Hello channels!" // ① 把字符串放进通道
+}()
+fmt.Println(&lt;-stringStream) // ② 从通道读出并打印
+</pre>
+</div>
+
+<p>
+  往只读通道写、从只写通道读都是<strong>编译错误</strong>，这是 Go 类型系统给并发原语提供的类型安全：
+</p>
+
+<div class="code" data-lang="text" data-file="编译错误">
+<pre>
+invalid operation: &lt;-writeStream (receive from send-only type chan&lt;- interface {})
+invalid operation: readStream &lt;- struct {} literal (send to receive-only type &lt;-chan interface {})
+</pre>
+</div>
+
+<p>
+  还记得「goroutine 被调度了也不保证在进程退出前运行」吗？上面的例子却总是正确的，为什么？因为<strong>通道是阻塞的</strong>：
+</p>
+<ul>
+  <li>往一个<strong>满</strong>的通道写，会等到通道有空位；</li>
+  <li>从一个<strong>空</strong>的通道读，会等到至少有一个元素。</li>
+</ul>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="无缓冲通道的发送和接收在同一时刻会合">
+  <text class="ttl on-b" x="120" y="26" text-anchor="middle">匿名 goroutine</text>
+  <text class="ttl on-a" x="640" y="26" text-anchor="middle">主 goroutine</text>
+  <path class="ln-d" d="M120 36 V196 M640 36 V196"/>
+  <rect class="bx-b" x="40" y="60" width="160" height="34" rx="7"/>
+  <text class="mono on-b" x="120" y="82" text-anchor="middle">s &lt;- "Hello"</text>
+  <text class="sm" x="120" y="112" text-anchor="middle">没人接就一直等</text>
+  <rect class="bx-a" x="560" y="60" width="160" height="34" rx="7"/>
+  <text class="mono on-a" x="640" y="82" text-anchor="middle">&lt;-s</text>
+  <text class="sm" x="640" y="112" text-anchor="middle">没东西就一直等</text>
+  <rect class="bx-c" x="300" y="56" width="160" height="42" rx="21"/>
+  <text class="mono on-c" x="380" y="82" text-anchor="middle">stringStream</text>
+  <path class="ln-c flow" d="M202 77 H296" marker-end="url(#ar-c)"/>
+  <path class="ln-c flow" d="M464 77 H556" marker-end="url(#ar-c)"/>
+  <rect class="bx-g" x="200" y="140" width="360" height="40" rx="10"/>
+  <text class="ttl on-g" x="380" y="165" text-anchor="middle">双方在这一刻「会合」，值完成交接</text>
+</svg>
+<figcaption>图 3-11　无缓冲通道：发送方和接收方必须同时就位</figcaption>
+</figure>
+
+<p>阻塞也意味着：结构写得不对就会<strong>死锁</strong>。下面用一个荒谬的条件阻止 goroutine 发送：</p>
+
+<div class="code" data-lang="go">
+<pre>
+stringStream := make(chan string)
+go func() {
+	if 0 != 1 { // ① 保证永远不会往通道里放值
+		return
+	}
+	stringStream &lt;- "Hello channels!"
+}()
+fmt.Println(&lt;-stringStream)
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+fatal error: all goroutines are asleep - deadlock!
+
+goroutine 1 [chan receive]:
+main.main()
+</pre>
+</div>
+
+<p>主 goroutine 在等一个永远不会来的值；匿名 goroutine 退出后，Go 正确地检测到所有 goroutine 都睡着了，报告死锁。</p>
+
+<h3 id="ch-close">关闭通道与 ok 习语</h3>
+
+<p>接收操作可以返回两个值：</p>
+
+<div class="code" data-lang="go" data-file="channels/fig-chan-recv-multi-value.go">
+<pre>
+stringStream := make(chan string)
+go func() {
+	stringStream &lt;- "Hello channels!"
+}()
+salutation, ok := &lt;-stringStream // ① 同时接收值和一个布尔值
+fmt.Printf("(%v): %v", ok, salutation) // (true): Hello channels!
+</pre>
+</div>
+
+<p>
+  第二个返回值表示：这次读到的值是<strong>别处真正写入的</strong>，还是<strong>因为通道已关闭而产生的零值</strong>。
+  在程序里能表达「不会再有值发过来了」非常有用，下游可以据此继续、退出或换个通道。我们可以为每种类型约定一个哨兵值，
+  但这是通道的功能，不是数据类型的功能。<strong>关闭通道就像一个通用的哨兵，宣告「上游不会再写了」</strong>：
+</p>
+
+<div class="code" data-lang="go" data-file="channels/fig-reading-from-closed-channel.go">
+<pre>
+intStream := make(chan int)
+close(intStream)
+integer, ok := &lt;-intStream // ① 从已关闭的通道读
+fmt.Printf("(%v): %v", ok, integer) // (false): 0
+</pre>
+</div>
+
+<p>
+  我们从没往通道里放过东西，但依然可以读，而且<strong>可以无限次地读</strong>，每次都立即得到零值和 <code>false</code>。这是为了支持「一个上游写者、多个下游读者」（第 4 章很常见）。
+</p>
+
+<p>这带来了一个新模式：<strong><code>range</code> 一个通道</strong>，通道关闭时循环自动结束：</p>
+
+<div class="code" data-lang="go" data-file="channels/fig-iterating-over-channel.go">
+<pre>
+intStream := make(chan int)
+go func() {
+	defer close(intStream) // ① 退出 goroutine 前一定关闭通道（非常常见的模式）
+	for i := 1; i &lt;= 5; i++ {
+		intStream &lt;- i
+	}
+}()
+
+for integer := range intStream { // ② range 会在通道关闭时自动退出循环
+	fmt.Printf("%v ", integer)
+}
+// 输出：1 2 3 4 5
+</pre>
+</div>
+
+<p>
+  关闭通道也是<strong>同时通知多个 goroutine</strong> 的方法之一：如果有 n 个 goroutine 在等同一个通道，不必写 n 次，关闭它就行。
+  因为已关闭的通道可以被无限次读取，有多少个等待者都无所谓，而且关闭比 n 次写入更便宜、更快：
+</p>
+
+<div class="code" data-lang="go" data-file="channels/fig-unblocking-goroutines.go">
+<pre>
+begin := make(chan interface{})
+var wg sync.WaitGroup
+for i := 0; i &lt; 5; i++ {
+	wg.Add(1)
+	go func(i int) {
+		defer wg.Done()
+		&lt;-begin // ① 等待「可以开始了」的信号
+		fmt.Printf("%v has begun\n", i)
+	}(i)
+}
+
+fmt.Println("Unblocking goroutines...")
+close(begin) // ② 关闭通道，同时放行所有 goroutine
+wg.Wait()
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="关闭一个通道同时唤醒所有等待的 goroutine">
+  <rect class="bx-a" x="40" y="70" width="150" height="56" rx="10"/>
+  <text class="mono on-a" x="115" y="94" text-anchor="middle">close(begin)</text>
+  <text class="sm" x="115" y="114" text-anchor="middle">只需一次操作</text>
+  <rect class="bx-c" x="250" y="76" width="120" height="44" rx="22"/>
+  <text class="mono on-c" x="310" y="103" text-anchor="middle">begin（已关闭）</text>
+  <path class="ln-a" d="M192 98 H246" marker-end="url(#ar-a)"/>
+  <path class="ln-c" d="M372 98 C 420 98, 430 30, 480 30" marker-end="url(#ar-c)"/>
+  <path class="ln-c" d="M372 98 C 420 98, 430 64, 480 64" marker-end="url(#ar-c)"/>
+  <path class="ln-c" d="M372 98 H476" marker-end="url(#ar-c)"/>
+  <path class="ln-c" d="M372 98 C 420 98, 430 132, 480 132" marker-end="url(#ar-c)"/>
+  <path class="ln-c" d="M372 98 C 420 98, 430 166, 480 166" marker-end="url(#ar-c)"/>
+  <rect class="bx-g" x="484" y="16" width="180" height="26" rx="6"/><text class="sm on-g" x="574" y="34" text-anchor="middle">goroutine 0：&lt;-begin 返回</text>
+  <rect class="bx-g" x="484" y="50" width="180" height="26" rx="6"/><text class="sm on-g" x="574" y="68" text-anchor="middle">goroutine 1：&lt;-begin 返回</text>
+  <rect class="bx-g" x="484" y="84" width="180" height="26" rx="6"/><text class="sm on-g" x="574" y="102" text-anchor="middle">goroutine 2：&lt;-begin 返回</text>
+  <rect class="bx-g" x="484" y="118" width="180" height="26" rx="6"/><text class="sm on-g" x="574" y="136" text-anchor="middle">goroutine 3：&lt;-begin 返回</text>
+  <rect class="bx-g" x="484" y="152" width="180" height="26" rx="6"/><text class="sm on-g" x="574" y="170" text-anchor="middle">goroutine 4：&lt;-begin 返回</text>
+</svg>
+<figcaption>图 3-12　close 是一种「广播」：所有在该通道上等待的读者同时被放行</figcaption>
+</figure>
+
+<p>
+  前面讲过 <code>sync.Cond</code> 也能做到这一点。但通道可以组合，所以这是作者最喜欢的「同时放行多个 goroutine」的方式。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：纯信号通道用 <code>chan struct{}</code></div>
+  <p>
+    书中大量使用 <code>chan interface{}</code> 作为「完成信号」通道。如今更地道的写法是 <code>chan struct{}</code>：
+    空结构体不占内存，类型本身就说明了「这个通道只传递信号、不传数据」。标准库的 <code>ctx.Done()</code> 返回的就是 <code>&lt;-chan struct{}</code>。
+    另外 Go 1.18 起 <code>interface{}</code> 可以写成 <code>any</code>。
+  </p>
+</div>
+
+<h3 id="ch-buffered">带缓冲的通道</h3>
+
+<p>
+  创建通道时可以给一个<strong>容量</strong>，这就是带缓冲的通道：即使没有人读，goroutine 也能先写入 n 次（n 是容量）。
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+var dataStream chan interface{}
+dataStream = make(chan interface{}, 4) // ① 容量为 4：不管有没有人读，都能先放 4 个
+</pre>
+</div>
+
+<p>
+  有意思的是，带缓冲通道的声明和无缓冲通道毫无区别 —— <strong>是创建通道的那个 goroutine 决定了它是否带缓冲</strong>。
+  这暗示着：通道的创建应该和执行写入的 goroutine 紧密耦合，这样才容易推理它的行为和性能。
+</p>
+
+<p>
+  其实无缓冲通道就是容量为 0 的带缓冲通道：<code>make(chan int)</code> 和 <code>make(chan int, 0)</code> 完全等价。
+  记得「写满了就阻塞、读空了就阻塞」吗？「满」和「空」是相对于容量说的：容量为 0 的通道在写入之前就已经「满」了。
+  容量为 4、没有读者的通道，写 4 次后变满，第 5 次写就会阻塞。所以带缓冲通道依然是阻塞的，只是条件不同 ——
+  <strong>它就是一个供并发进程通信用的内存 FIFO 队列</strong>。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 360" role="img" aria-label="容量为 4 的带缓冲通道依次写入 A 到 E 再读出的过程">
+  <!-- 行 1 -->
+  <text class="mono" x="20" y="44">c := make(chan rune, 4)</text>
+  <rect class="bx" x="300" y="22" width="56" height="34" rx="6"/><rect class="bx" x="360" y="22" width="56" height="34" rx="6"/>
+  <rect class="bx" x="420" y="22" width="56" height="34" rx="6"/><rect class="bx" x="480" y="22" width="56" height="34" rx="6"/>
+  <text class="sm" x="560" y="44">4 个空槽</text>
+  <!-- 行 2 -->
+  <text class="mono" x="20" y="98">c &lt;- 'A'</text>
+  <rect class="bx-c" x="300" y="76" width="56" height="34" rx="6"/><text class="mono on-c" x="328" y="98" text-anchor="middle">A</text>
+  <rect class="bx" x="360" y="76" width="56" height="34" rx="6"/><rect class="bx" x="420" y="76" width="56" height="34" rx="6"/><rect class="bx" x="480" y="76" width="56" height="34" rx="6"/>
+  <text class="sm" x="560" y="98">没有读者，A 放进第一个槽</text>
+  <!-- 行 3 -->
+  <text class="mono" x="20" y="152">c &lt;- 'B'; c &lt;- 'C'; c &lt;- 'D'</text>
+  <rect class="bx-c" x="300" y="130" width="56" height="34" rx="6"/><text class="mono on-c" x="328" y="152" text-anchor="middle">A</text>
+  <rect class="bx-c" x="360" y="130" width="56" height="34" rx="6"/><text class="mono on-c" x="388" y="152" text-anchor="middle">B</text>
+  <rect class="bx-c" x="420" y="130" width="56" height="34" rx="6"/><text class="mono on-c" x="448" y="152" text-anchor="middle">C</text>
+  <rect class="bx-c" x="480" y="130" width="56" height="34" rx="6"/><text class="mono on-c" x="508" y="152" text-anchor="middle">D</text>
+  <text class="sm" x="560" y="152">满了</text>
+  <!-- 行 4 -->
+  <text class="mono" x="20" y="206">c &lt;- 'E'</text>
+  <rect class="bx-c" x="300" y="184" width="56" height="34" rx="6"/><text class="mono on-c" x="328" y="206" text-anchor="middle">A</text>
+  <rect class="bx-c" x="360" y="184" width="56" height="34" rx="6"/><text class="mono on-c" x="388" y="206" text-anchor="middle">B</text>
+  <rect class="bx-c" x="420" y="184" width="56" height="34" rx="6"/><text class="mono on-c" x="448" y="206" text-anchor="middle">C</text>
+  <rect class="bx-c" x="480" y="184" width="56" height="34" rx="6"/><text class="mono on-c" x="508" y="206" text-anchor="middle">D</text>
+  <rect class="bx-r" x="560" y="184" width="40" height="34" rx="6"/><text class="mono on-r" x="580" y="206" text-anchor="middle">E</text>
+  <text class="sm on-r" x="610" y="206">写者阻塞 ⏳</text>
+  <!-- 行 5 -->
+  <text class="mono" x="20" y="260">&lt;-c　（读出一个）</text>
+  <rect class="bx-g" x="236" y="238" width="44" height="34" rx="6"/><text class="mono on-g" x="258" y="260" text-anchor="middle">A</text>
+  <path class="ln-g" d="M298 255 H284" marker-end="url(#ar-g)"/>
+  <rect class="bx-c" x="300" y="238" width="56" height="34" rx="6"/><text class="mono on-c" x="328" y="260" text-anchor="middle">B</text>
+  <rect class="bx-c" x="360" y="238" width="56" height="34" rx="6"/><text class="mono on-c" x="388" y="260" text-anchor="middle">C</text>
+  <rect class="bx-c" x="420" y="238" width="56" height="34" rx="6"/><text class="mono on-c" x="448" y="260" text-anchor="middle">D</text>
+  <rect class="bx-c" x="480" y="238" width="56" height="34" rx="6"/><text class="mono on-c" x="508" y="260" text-anchor="middle">E</text>
+  <text class="sm" x="560" y="260">读者拿到最早的 A；E 被放到队尾</text>
+  <path class="ln-d" d="M20 296 H740"/>
+  <text class="lbl" x="380" y="322" text-anchor="middle">先进先出（FIFO）。若缓冲区为空且已有接收者在等，值会绕过缓冲区直接交给接收者。</text>
+  <text class="sm" x="380" y="344" text-anchor="middle">「满」和「空」是相对容量而言：无缓冲通道（容量 0）在任何写入之前就已经是「满」的</text>
+</svg>
+<figcaption>图 3-13　带缓冲的通道就是一个 FIFO 队列</figcaption>
+</figure>
+
+<div class="box warn">
+  <div class="t">&#9888; 谨慎使用缓冲</div>
+  <p>
+    带缓冲的通道在某些场景下有用，但要小心创建。下一章会看到，它很容易变成<strong>过早优化</strong>，还会<strong>掩盖死锁</strong>（让死锁变得不太容易发生）。
+    听起来像好事？你肯定更希望在第一次写代码时就发现死锁，而不是半夜生产系统宕机时。
+  </p>
+</div>
+
+<div class="code" data-lang="go" data-file="channels/fig-using-buffered-chans.go">
+<pre>
+var stdoutBuff bytes.Buffer         // ① 内存缓冲区，减轻输出的不确定性（并不保证）
+defer stdoutBuff.WriteTo(os.Stdout) // ② 进程退出前写到标准输出
+
+intStream := make(chan int, 4) // ③ 容量为 4 的带缓冲通道
+go func() {
+	defer close(intStream)
+	defer fmt.Fprintln(&amp;stdoutBuff, "Producer Done.")
+	for i := 0; i &lt; 5; i++ {
+		fmt.Fprintf(&amp;stdoutBuff, "Sending: %d\n", i)
+		intStream &lt;- i
+	}
+}()
+
+for integer := range intStream {
+	fmt.Fprintf(&amp;stdoutBuff, "Received %v.\n", integer)
+}
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="一次可能的输出">
+<pre>
+Sending: 0
+Sending: 1
+Sending: 2
+Sending: 3
+Sending: 4
+Producer Done.
+Received 0.
+Received 1.
+Received 2.
+Received 3.
+Received 4.
+</pre>
+</div>
+
+<p>
+  可以看到匿名 goroutine 在主 goroutine 读出第一个值之前，就把 5 个结果全放进了通道并退出。
+  这是一种在合适条件下有用的优化：<strong>如果写者知道自己要写多少次，可以创建容量等于写入次数的通道，然后尽快写完</strong>。当然也有注意事项，下一章再说。
+</p>
+
+<h3 id="ch-nil">nil 通道</h3>
+
+<p>通道的零值是 <code>nil</code>。对 nil 通道做各种操作会怎样？</p>
+
+<div class="cards">
+  <div class="card"><h4>读 nil 通道</h4><p><code>&lt;-dataStream</code> 永远阻塞（这里所有 goroutine 都阻塞了，所以报 deadlock）。</p></div>
+  <div class="card"><h4>写 nil 通道</h4><p><code>dataStream &lt;- struct{}{}</code> 同样永远阻塞。</p></div>
+  <div class="card"><h4>关闭 nil 通道</h4><p><code>close(dataStream)</code> 直接 <strong>panic: close of nil channel</strong>。最糟的结果。</p></div>
+</div>
+
+<p>所以一定要确保你使用的通道已经初始化。（第 4 章会看到，「读 nil 通道永远阻塞」这个特性在 <code>select</code> 里反而很有用。）</p>
+
+<h3 id="ch-table">通道操作速查表</h3>
+
+<p>把前面的规则汇总成一张表（对应原书表 3-2），建议收藏：</p>
+
+<div class="tw">
+<table>
+  <tr><th>操作</th><th>通道状态</th><th>结果</th></tr>
+  <tr><td rowspan="5"><strong>读</strong> <code>&lt;-ch</code></td><td>nil</td><td><span class="wait">阻塞</span></td></tr>
+  <tr><td>打开且非空</td><td><span class="ok">得到值</span></td></tr>
+  <tr><td>打开且为空</td><td><span class="wait">阻塞</span></td></tr>
+  <tr><td>已关闭</td><td><span class="ok">&lt;零值&gt;, false</span>（缓冲区里剩下的值会先被读完）</td></tr>
+  <tr><td>只写通道</td><td><span class="bad">编译错误</span></td></tr>
+  <tr><td rowspan="5"><strong>写</strong> <code>ch &lt;- v</code></td><td>nil</td><td><span class="wait">阻塞</span></td></tr>
+  <tr><td>打开且已满</td><td><span class="wait">阻塞</span></td></tr>
+  <tr><td>打开且未满</td><td><span class="ok">写入值</span></td></tr>
+  <tr><td>已关闭</td><td><span class="bad">panic</span></td></tr>
+  <tr><td>只读通道</td><td><span class="bad">编译错误</span></td></tr>
+  <tr><td rowspan="5"><strong>关闭</strong> <code>close(ch)</code></td><td>nil</td><td><span class="bad">panic</span></td></tr>
+  <tr><td>打开且非空</td><td><span class="ok">关闭通道</span>；读操作先读完剩余值，之后得到零值</td></tr>
+  <tr><td>打开且为空</td><td><span class="ok">关闭通道</span>；读操作得到零值</td></tr>
+  <tr><td>已关闭</td><td><span class="bad">panic</span></td></tr>
+  <tr><td>只读通道</td><td><span class="bad">编译错误</span></td></tr>
+</table>
+</div>
+
+<p>
+  三种操作会让 goroutine 阻塞，三种操作会让程序 panic！乍一看通道很危险，但只要搞清楚这些结果的动机、给通道的使用定好框架，它们就不再可怕，反而非常合理。
+</p>
+
+<h3 id="ownership">通道所有权</h3>
+
+<p>
+  第一件事是<strong>明确通道的所有权</strong>。作者把「所有者」定义为：<strong>创建、写入并关闭通道的那个 goroutine</strong>。
+  就像没有 GC 的语言里的内存一样，弄清楚谁拥有通道，才能对程序进行逻辑推理。单向通道就是区分所有者和使用者的工具：
+  所有者持有可写的视图（<code>chan</code> 或 <code>chan&lt;-</code>），使用者只持有只读视图（<code>&lt;-chan</code>）。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="通道所有者负责创建、写入、关闭；消费者只读并处理阻塞和关闭">
+  <rect class="bx-a" x="20" y="20" width="320" height="220" rx="14"/>
+  <text class="ttl on-a" x="180" y="46" text-anchor="middle">所有者（owner）</text>
+  <text class="sm" x="180" y="66" text-anchor="middle">持有 chan / chan&lt;-</text>
+  <rect class="bx" x="44" y="80" width="272" height="30" rx="7"/><text class="sm" x="180" y="100" text-anchor="middle">1. 创建通道（make）</text>
+  <rect class="bx" x="44" y="116" width="272" height="30" rx="7"/><text class="sm" x="180" y="136" text-anchor="middle">2. 写入，或把所有权交给另一个 goroutine</text>
+  <rect class="bx" x="44" y="152" width="272" height="30" rx="7"/><text class="sm" x="180" y="172" text-anchor="middle">3. 关闭通道（close）</text>
+  <rect class="bx" x="44" y="188" width="272" height="30" rx="7"/><text class="sm" x="180" y="208" text-anchor="middle">4. 把以上封装起来，只暴露只读通道</text>
+
+  <path class="ln-c flow" d="M344 130 H416" marker-end="url(#ar-c)"/>
+  <text class="mono on-c" x="380" y="118" text-anchor="middle">&lt;-chan</text>
+
+  <rect class="bx-b" x="420" y="20" width="320" height="220" rx="14"/>
+  <text class="ttl on-b" x="580" y="46" text-anchor="middle">消费者（consumer）</text>
+  <text class="sm" x="580" y="66" text-anchor="middle">只持有 &lt;-chan</text>
+  <rect class="bx" x="444" y="90" width="272" height="44" rx="7"/><text class="sm" x="580" y="110" text-anchor="middle">1. 知道通道什么时候关闭</text><text class="sm" x="580" y="126" text-anchor="middle">（检查 ok，或用 range）</text>
+  <rect class="bx" x="444" y="146" width="272" height="44" rx="7"/><text class="sm" x="580" y="166" text-anchor="middle">2. 负责任地处理阻塞</text><text class="sm" x="580" y="182" text-anchor="middle">（超时、被告知停止，或就这么等着）</text>
+  <text class="lbl" x="380" y="262" text-anchor="middle">所有者消除了 nil 通道死锁、关闭 nil 通道、写已关闭通道、重复关闭这几类 panic 的风险</text>
+</svg>
+<figcaption>图 3-14　通道所有权：职责清晰，表里的危险结果就自然避开了</figcaption>
+</figure>
+
+<p>由所有者承担这些职责，会带来：</p>
+<ul>
+  <li>通道是我们创建的 → 消除了<strong>写 nil 通道导致死锁</strong>、<strong>关闭 nil 通道导致 panic</strong> 的风险；</li>
+  <li>何时关闭由我们决定 → 消除了<strong>写已关闭通道</strong>、<strong>重复关闭</strong>导致 panic 的风险；</li>
+  <li>利用编译期的类型检查，防止别人错误地写我们的通道。</li>
+</ul>
+
+<p>作为消费者，只需要操心两件事：<strong>知道通道什么时候关闭</strong>（检查第二个返回值）；<strong>负责任地处理阻塞</strong> —— 想超时、想在被告知时停止，还是愿意一直阻塞，取决于你的算法。下一章会讲各种实现方式。</p>
+
+<div class="code" data-lang="go" data-file="channels/fig-chan-ownership.go">
+<pre>
+chanOwner := func() &lt;-chan int {
+	resultStream := make(chan int, 5) // ① 已知要产生 6 个结果，建一个容量为 5 的缓冲通道，让 goroutine 尽快完成
+	go func() {                       // ② 启动匿名 goroutine 往 resultStream 写；注意 goroutine 被封装在函数内部了
+		defer close(resultStream)     // ③ 作为所有者，用完一定关闭
+		for i := 0; i &lt;= 5; i++ {
+			resultStream &lt;- i
+		}
+	}()
+	return resultStream // ④ 返回值声明为只读通道，自动转换
+}
+
+resultStream := chanOwner()
+for result := range resultStream { // ⑤ 消费者只关心阻塞和关闭
+	fmt.Printf("Received: %d\n", result)
+}
+fmt.Println("Done receiving!")
+</pre>
+</div>
+
+<p>
+  <code>resultStream</code> 的整个生命周期都封装在 <code>chanOwner</code> 里：写入显然不会发生在 nil 或已关闭的通道上，关闭也只会发生一次。
+  作者强烈建议<strong>让通道所有权的范围尽量小</strong>。如果一个结构体把通道作为字段、又有一堆方法，通道的行为很快就会变得难以判断。
+  你的程序也许依然会出现死锁或 panic，但出现时你多半会发现：要么所有权范围太大了，要么所有权变得不清楚了。
+</p>
+
+<!-- ============================================================ -->
+<h2 id="select">select 语句</h2>
+
+<p>
+  如果说通道是把 goroutine 粘在一起的胶水，那 <code>select</code> 就是<strong>把通道粘在一起的胶水</strong>。
+  它让我们能在程序中组合通道，形成更大的抽象。说 <code>select</code> 是并发 Go 程序中最关键的东西之一，一点也不夸张。
+  它可以在一个函数或类型内部把通道绑在一起，也可以在系统中两个组件的交界处工作；还能把通道和取消、超时、等待、默认值等概念安全地结合起来。
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+var c1, c2 &lt;-chan interface{}
+var c3 chan&lt;- interface{}
+select {
+case &lt;-c1:
+	// 做点什么
+case &lt;-c2:
+	// 做点什么
+case c3 &lt;- struct{}{}:
+	// 做点什么
+}
+</pre>
+</div>
+
+<p>
+  看起来像 <code>switch</code>，但相似之处仅此而已。和 <code>switch</code> 不同，<code>select</code> 的 <code>case</code> 不是按顺序测试的，
+  条件都不满足时也不会「落空」继续往下。<strong>所有通道的读写会被同时考虑，看哪个已经就绪</strong>：读的话，通道里有值或已关闭；写的话，通道还没满。
+  一个都没就绪，整个 <code>select</code> 就阻塞；有一个就绪了，就执行对应的操作和语句。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="select 同时监听多个通道操作，选择其中已就绪的一个">
+  <rect class="bx-b" x="20" y="24" width="150" height="40" rx="8"/><text class="mono on-b" x="95" y="49" text-anchor="middle">&lt;-c1　就绪 ✓</text>
+  <rect class="bx" x="20" y="94" width="150" height="40" rx="8"/><text class="mono" x="95" y="119" text-anchor="middle">&lt;-c2　未就绪</text>
+  <rect class="bx-b" x="20" y="164" width="150" height="40" rx="8"/><text class="mono on-b" x="95" y="189" text-anchor="middle">c3 &lt;- v　就绪 ✓</text>
+  <path class="ln-b" d="M172 44 C 230 44, 240 114, 290 114" marker-end="url(#ar-b)"/>
+  <path class="ln-d" d="M172 114 H286"/>
+  <path class="ln-b" d="M172 184 C 230 184, 240 114, 290 114" marker-end="url(#ar-b)"/>
+  <rect class="bx-a" x="294" y="74" width="180" height="80" rx="12"/>
+  <text class="ttl on-a" x="384" y="104" text-anchor="middle">select</text>
+  <text class="sm" x="384" y="124" text-anchor="middle">多个就绪：伪随机均匀选一个</text>
+  <text class="sm" x="384" y="140" text-anchor="middle">都没就绪：阻塞（或走 default）</text>
+  <path class="ln-a" d="M476 114 H530" marker-end="url(#ar-a)"/>
+  <rect class="bx-g" x="534" y="94" width="206" height="40" rx="8"/><text class="sm on-g" x="637" y="119" text-anchor="middle">执行被选中的那个 case</text>
+</svg>
+<figcaption>图 3-15　select：同时等待多个通道操作</figcaption>
+</figure>
+
+<div class="code" data-lang="go" data-file="the-select-statement/fig-select-blocking.go">
+<pre>
+start := time.Now()
+c := make(chan interface{})
+go func() {
+	time.Sleep(5 * time.Second)
+	close(c) // ① 5 秒后关闭通道
+}()
+
+fmt.Println("Blocking on read...")
+select {
+case &lt;-c: // ② 尝试读。这里其实不需要 select，直接 &lt;-c 也行，但我们会扩展这个例子
+	fmt.Printf("Unblocked %v later.\n", time.Since(start))
+}
+// Blocking on read...
+// Unblocked 5.000170047s later.
+</pre>
+</div>
+
+<p>这是一种简单高效的「等某事发生」的方式。但仔细想想，会冒出几个问题：</p>
+<ol>
+  <li>多个通道都可读时会怎样？</li>
+  <li>如果没有任何通道会就绪呢？</li>
+  <li>如果没有通道就绪时，我们想先做点别的呢？</li>
+</ol>
+
+<h3 id="select-random">问题 1：多个通道同时就绪</h3>
+
+<div class="code" data-lang="go" data-file="the-select-statement/fig-select-uniform-distribution.go">
+<pre>
+c1 := make(chan interface{}); close(c1)
+c2 := make(chan interface{}); close(c2)
+
+var c1Count, c2Count int
+for i := 1000; i &gt;= 0; i-- {
+	select {
+	case &lt;-c1:
+		c1Count++
+	case &lt;-c2:
+		c2Count++
+	}
+}
+fmt.Printf("c1Count: %d\nc2Count: %d\n", c1Count, c2Count)
+// c1Count: 505
+// c2Count: 496
+</pre>
+</div>
+
+<p>
+  一千次里大约一半读了 c1，一半读了 c2。这不是巧合：<strong>Go 运行时会在就绪的 case 里做伪随机的均匀选择</strong>，每个 case 被选中的机会相等。
+  原因很有意思：运行时无法知道你把这组通道放进 <code>select</code> 的意图，它能做的最好的事就是在<em>平均情况</em>下表现良好。
+  引入随机变量、给每个通道相同的概率，所有用 <code>select</code> 的 Go 程序在平均情况下都会表现良好（也避免了某个通道被饿死）。
+</p>
+
+<h3 id="select-timeout">问题 2：永远没有通道就绪 —— 超时</h3>
+
+<div class="code" data-lang="go" data-file="the-select-statement/fig-select-timeouts.go">
+<pre>
+var c &lt;-chan int
+select {
+case &lt;-c: // ① 读 nil 通道，永远不会就绪
+case &lt;-time.After(1 * time.Second):
+	fmt.Println("Timed out.")
+}
+</pre>
+</div>
+
+<p>
+  <code>time.After</code> 接受一个时长，返回一个通道，在那段时间之后往通道里发送当前时间。这为 <code>select</code> 提供了一种简洁的超时方式。
+  第 4 章会介绍更健壮的方案（<code>context</code>）。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：定时器的两个变化 <span class="ver">Go 1.23+</span></div>
+  <ul>
+    <li>在 Go 1.23 之前，在循环里反复调用 <code>time.After</code> 会让每个定时器一直存活到触发为止，高频循环里可能累积大量内存；类似地，<code>time.Tick</code> 创建的 Ticker 永远不会被回收。Go 1.23 起，<strong>不再被引用的 Timer/Ticker 即使没有 Stop 也能被 GC 回收</strong>，<code>time.Tick</code> 的文档也删除了「会泄漏」的警告。</li>
+    <li>同样从 Go 1.23 起，定时器的通道变成了同步（无缓冲）的：<code>Reset</code>、<code>Stop</code> 之后保证不会再收到旧的过期值，不再需要以前那种「Stop 后清空通道」的繁琐写法。</li>
+  </ul>
+  <p>在 Go 1.23–1.26 中，这两项变化只对 <code>go.mod</code> 声明 <code>go 1.23</code> 或更高的模块生效（可用 <code>GODEBUG=asynctimerchan=1</code> 退回）；Go 1.27 移除了这个开关，统一采用新行为。对于跨多个函数调用的超时，仍然推荐用 <code>context.WithTimeout</code>。</p>
+</div>
+
+<h3 id="select-default">问题 3：没有就绪时做别的事 —— default</h3>
+
+<div class="code" data-lang="go" data-file="the-select-statement/fig-select-default-clause.go">
+<pre>
+start := time.Now()
+var c1, c2 &lt;-chan int
+select {
+case &lt;-c1:
+case &lt;-c2:
+default:
+	fmt.Printf("In default after %v\n\n", time.Since(start)) // In default after 1.421µs
+}
+</pre>
+</div>
+
+<p>
+  <code>default</code> 几乎是立即执行的，这让你可以不阻塞地退出 <code>select</code>。它通常和 <strong>for-select 循环</strong>一起使用，
+  让 goroutine 在等待另一个 goroutine 报告结果的同时继续推进工作：
+</p>
+
+<div class="code" data-lang="go" data-file="the-select-statement/fig-select-for-select-default.go">
+<pre>
+done := make(chan interface{})
+go func() {
+	time.Sleep(5 * time.Second)
+	close(done)
+}()
+
+workCounter := 0
+loop:
+for {
+	select {
+	case &lt;-done:
+		break loop // 用标签跳出外层 for（单写 break 只会跳出 select）
+	default:
+	}
+
+	// 模拟工作
+	workCounter++
+	time.Sleep(1 * time.Second)
+}
+
+fmt.Printf("Achieved %v cycles of work before signalled to stop.\n", workCounter)
+// Achieved 5 cycles of work before signalled to stop.
+</pre>
+</div>
+
+<p>
+  最后还有一个特殊情况：没有任何 case 的 <code>select {}</code>，它会<strong>永远阻塞</strong>。第 6 章会深入 <code>select</code> 的工作原理。
+</p>
+
+<!-- ============================================================ -->
+<h2 id="gomaxprocs">GOMAXPROCS 调节杆</h2>
+
+<p>
+  <code>runtime</code> 包里有个函数叫 <code>GOMAXPROCS</code>。作者认为这个名字有误导性：人们常以为它和宿主机的逻辑处理器数有关（间接来说确实有），
+  但它真正控制的是<strong>承载所谓「工作队列」的 OS 线程数量</strong>（第 6 章详解）。
+</p>
+
+<p>
+  Go 1.5 之前，<code>GOMAXPROCS</code> 默认是 1，几乎每个程序里都能看到 <code>runtime.GOMAXPROCS(runtime.NumCPU())</code>。
+  因为几乎所有人都想用满所有核，后来的版本把它默认设为宿主机的逻辑 CPU 数。
+</p>
+
+<p>
+  大多数时候你不需要调它。作者分享过一个例子：一个项目的测试套件被竞态条件困扰，测试机只有 4 个逻辑 CPU，同一时刻只有 4 个 goroutine 在执行。
+  他们把 <code>GOMAXPROCS</code> 调到超过 CPU 数，竞态被触发得更频繁，于是更快地修掉了它们。
+  如果你通过实验发现某个值让程序跑得更好，作者提醒：<strong>每次提交、换硬件、换 Go 版本都要重新验证</strong>。调这个值让程序更贴近硬件，代价是抽象和长期性能的稳定性。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：GOMAXPROCS 会感知容器配额并自动更新 <span class="ver">Go 1.25+</span></div>
+  <p>
+    以前在 Docker/Kubernetes 里，<code>runtime.NumCPU()</code> 返回的是宿主机的核数，而容器可能只被分配了 2 个 CPU 的配额，
+    导致线程过多、频繁被限流，大家只好引入 <code>go.uber.org/automaxprocs</code>。Go 1.25 起，在 Linux 上 <code>GOMAXPROCS</code> 的默认值会综合
+    逻辑 CPU 数、CPU 亲和性掩码和 <strong>cgroup 的 CPU 配额</strong>，并且会在这些条件变化时<strong>周期性地自动更新</strong>。
+    手动设置 <code>GOMAXPROCS</code> 环境变量或调用 <code>runtime.GOMAXPROCS(n)</code> 会关闭自动更新；该行为由 <code>go.mod</code> 的 go 版本（≥1.25）控制，可用 <code>GODEBUG=containermaxprocs=0</code> 退回旧行为。
+    另外，想用不同并行度跑测试时，可以用 <code>go test -cpu=1,2,4,8</code>。
+  </p>
+</div>
+
+<h2 id="summary">本章小结</h2>
+
+<div class="tw">
+<table>
+  <tr><th>构件</th><th>一句话</th><th>最适合</th></tr>
+  <tr><td><code>go f()</code></td><td>启动一个并发运行的函数</td><td>任何可以并发的工作单元，放心多开</td></tr>
+  <tr><td><code>sync.WaitGroup</code></td><td>等待一组 goroutine 结束</td><td>不关心结果、或结果另有渠道收集</td></tr>
+  <tr><td><code>sync.Mutex</code> / <code>RWMutex</code></td><td>保护临界区</td><td>结构体内部状态；读多写少用 RWMutex</td></tr>
+  <tr><td><code>sync.Cond</code></td><td>等待 / 广播事件</td><td>需要反复广播且性能敏感的场景（少见）</td></tr>
+  <tr><td><code>sync.Once</code></td><td>只执行一次</td><td>懒初始化；新代码优先 <code>OnceFunc/OnceValue</code></td></tr>
+  <tr><td><code>sync.Pool</code></td><td>复用临时对象</td><td>高频分配的同质对象，如缓冲区</td></tr>
+  <tr><td>channel</td><td>在 goroutine 间传递数据和所有权</td><td>转移所有权、协调多段逻辑、组合</td></tr>
+  <tr><td><code>select</code></td><td>同时等待多个通道操作</td><td>超时、取消、非阻塞操作、组合通道</td></tr>
+</table>
+</div>
+
+<div class="exercise">
+  <h3>&#9998; 动手练习</h3>
+  <ol>
+    <li>新建一个模块，<code>go.mod</code> 里先写 <code>go 1.21</code> 运行循环闭包的例子，再改成 <code>go 1.22</code> 运行，对比输出。</li>
+    <li>把 <code>fig-wait-group.go</code> 里的 <code>wg.Add(1)</code> 挪进 goroutine 内部，运行 <code>go vet</code> 看看报什么；再用 <code>wg.Go</code> 重写。</li>
+    <li>不看书，写出通道操作速查表中「关闭」那一行的五种结果。然后写程序逐一验证。</li>
+    <li>用 <code>chanOwner</code> 的模式写一个函数 <code>func countdown(n int) &lt;-chan int</code>，每秒输出一个数直到 0 后关闭通道。</li>
+    <li>用 <code>sync.OnceValue</code> 实现一个只读取一次环境变量的 <code>getConfig()</code>，并发调用 100 次验证它只读了一次。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

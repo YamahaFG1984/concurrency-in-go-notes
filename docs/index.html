@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Go 并发编程 · 图解学习笔记</title>
+<meta name="description" content="《Concurrency in Go》的中文图解学习笔记：goroutine、channel、select、sync、并发模式、context、限流、心跳与 Go 运行时调度，并标注 Go 1.8 之后的新特性与新写法。">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="0">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<div class="hero">
+  <span class="chapter-eyebrow">面向初学者的图解笔记 · 6 章 + 2 个附录</span>
+  <h1>Go 并发编程：从原理到模式</h1>
+  <p class="sub">
+    这套笔记整理自 O'Reilly 出版的《Concurrency in Go》（Katherine Cox-Buday 著）和本仓库附带的全部示例代码。
+    原书的脉络完整保留：<strong>为什么并发难 → Go 的并发哲学 → 基本构件 → 组合模式 → 大型系统里的实践 → 运行时如何调度</strong>。
+    每一章都配了大量示意图，把「看不见」的 goroutine、通道和调度过程画出来。
+  </p>
+  <p class="sub" style="margin-top:10px">
+    原书写于 2017 年，那时是 <span class="ver old">Go 1.8</span>。此后 Go 在并发方面变化不少 ——
+    循环变量语义、泛型、<code>WaitGroup.Go</code>、<code>context</code> 的新函数、异步抢占、<code>testing/synctest</code>、goroutine 泄漏分析……
+    凡是书中写法已经过时或有了更好选择的地方，笔记都用青色的 <span class="ver">新版 Go</span> 注释框标了出来，并在附录 B 汇总。
+  </p>
+  <p style="margin-top:14px">
+    <span class="pill">goroutine</span><span class="pill">channel</span><span class="pill">select</span>
+    <span class="pill">sync.Mutex / WaitGroup / Cond / Once / Pool</span><span class="pill">pipeline</span>
+    <span class="pill">fan-out / fan-in</span><span class="pill">context</span><span class="pill">限流</span>
+    <span class="pill">心跳</span><span class="pill">work stealing</span><span class="pill">race detector</span>
+  </p>
+</div>
+
+<h2 id="map">全书地图</h2>
+
+<p>
+  这本书像一座五层的楼：最底层是「并发为什么难」的通用理论，往上是 Go 给出的答案（CSP 思想），
+  然后是具体的语言构件，再往上是把构件组合起来的模式，最高层是把模式用在大型系统里。
+  第 6 章则是从地下室看这栋楼的地基 —— 运行时到底怎样把成千上万个 goroutine 跑在少数几个线程上。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 340" role="img" aria-label="全书结构：从理论到构件到模式到系统，运行时是地基">
+  <rect class="bx-p" x="250" y="18"  width="260" height="50" rx="10"/>
+  <text class="ttl on-p" x="380" y="40" text-anchor="middle">第 5 章 · 大规模并发</text>
+  <text class="sm" x="380" y="58" text-anchor="middle">错误传播 · 超时取消 · 心跳 · 限流 · 自愈</text>
+
+  <rect class="bx-g" x="190" y="78"  width="380" height="50" rx="10"/>
+  <text class="ttl on-g" x="380" y="100" text-anchor="middle">第 4 章 · 并发模式</text>
+  <text class="sm" x="380" y="118" text-anchor="middle">管道 · 扇入扇出 · or-channel · tee · bridge · 队列 · context</text>
+
+  <rect class="bx-b" x="130" y="138" width="500" height="50" rx="10"/>
+  <text class="ttl on-b" x="380" y="160" text-anchor="middle">第 3 章 · 并发构件</text>
+  <text class="sm" x="380" y="178" text-anchor="middle">goroutine · channel · select · sync.WaitGroup / Mutex / Cond / Once / Pool</text>
+
+  <rect class="bx-a" x="70"  y="198" width="620" height="50" rx="10"/>
+  <text class="ttl on-a" x="380" y="220" text-anchor="middle">第 1–2 章 · 思想</text>
+  <text class="sm" x="380" y="238" text-anchor="middle">竞态 · 原子性 · 死锁 / 活锁 / 饥饿 · 并发 ≠ 并行 · CSP · 「用通道共享内存」</text>
+
+  <rect class="bx-c" x="20"  y="262" width="720" height="56" rx="10"/>
+  <text class="ttl on-c" x="380" y="285" text-anchor="middle">第 6 章 · 运行时（地基）</text>
+  <text class="sm" x="380" y="304" text-anchor="middle">M:N 调度 · 工作窃取 · 延续窃取 · G / M / P · 抢占    ＋ 附录：race detector · pprof · trace</text>
+</svg>
+<figcaption>图 0-1　全书结构：越往上越接近「写系统」，越往下越接近「机器」</figcaption>
+</figure>
+
+<h2 id="who">这套笔记写给谁</h2>
+<ul>
+  <li><strong>会写基本的 Go 代码</strong>（变量、函数、切片、结构体、接口、错误处理），但一碰到 goroutine 和通道就心里没底的人。</li>
+  <li><strong>写过并发代码，但总被「偶发 bug」折磨</strong>的人 —— 死锁、goroutine 泄漏、测试时好时坏。第 1、4、5 章就是为你写的。</li>
+  <li><strong>想知道书里的写法放到今天还对不对</strong>的人。每一处过时的地方都有新写法的对照。</li>
+</ul>
+
+<div class="box note">
+  <div class="t">&#9432; 前置知识</div>
+  <p>
+    原书「不讲 Go 基础语法」。如果你对闭包（在函数里定义函数、并引用外面的变量）、<code>defer</code>、接口还不熟，
+    建议先过一遍 <a href="https://go.dev/tour/">A Tour of Go</a>。书里的例子大量使用「在 <code>main</code> 里定义匿名函数」的写法，
+    这只是为了让每个例子都能单文件运行，并不是推荐的工程组织方式。
+  </p>
+</div>
+
+<h2 id="legend">怎么读这些注释框</h2>
+
+<div class="box key"><div class="t">&#9733; 核心要点</div><p>这一节最值得记住的一句话。</p></div>
+<div class="box tip"><div class="t">&#10003; 实践建议</div><p>工作中可以直接照做的经验。</p></div>
+<div class="box warn"><div class="t">&#9888; 陷阱</div><p>容易写错、而且错了很难查的地方。</p></div>
+<div class="box deep"><div class="t">&#128270; 深入一点</div><p>可以先跳过、学有余力再回来看的背景知识。</p></div>
+<div class="box modern"><div class="t">&#127381; 新版 Go <span class="ver">Go 1.22+</span></div><p>书出版之后 Go 发生的变化：哪些写法已经过时、有什么更好的新 API。徽章表示从哪个版本开始。</p></div>
+
+<h2 id="timeline">书出版之后，Go 的并发相关变化</h2>
+
+<p>先混个眼熟，具体内容会在对应章节出现，附录 B 有完整汇总：</p>
+
+<figure class="wide">
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="Go 1.8 到 Go 1.27 并发相关特性时间线">
+  <path class="ln" d="M30 165 H735" marker-end="url(#ar)"/>
+  <!-- 书 -->
+  <circle class="dot-a" cx="44" cy="165" r="7"/>
+  <text class="ttl on-a" x="44" y="146" text-anchor="middle">1.8</text>
+  <text class="sm" x="44" y="190" text-anchor="middle">2017</text>
+  <text class="sm" x="44" y="204" text-anchor="middle">本书</text>
+
+  <!-- 上方 -->
+  <circle class="dot-c" cx="100" cy="165" r="5"/><path class="ln-d" d="M100 160 V64"/>
+  <rect class="bx-c" x="64" y="20" width="96" height="44" rx="7"/>
+  <text class="mono on-c" x="112" y="37" text-anchor="middle">1.9</text>
+  <text class="sm" x="112" y="54" text-anchor="middle">sync.Map 等</text>
+
+  <circle class="dot-c" cx="200" cy="165" r="5"/><path class="ln-d" d="M200 160 V64"/>
+  <rect class="bx-c" x="166" y="20" width="96" height="44" rx="7"/>
+  <text class="mono on-c" x="214" y="37" text-anchor="middle">1.14</text>
+  <text class="sm" x="214" y="54" text-anchor="middle">异步抢占</text>
+
+  <circle class="dot-c" cx="300" cy="165" r="5"/><path class="ln-d" d="M300 160 V64"/>
+  <rect class="bx-c" x="268" y="20" width="96" height="44" rx="7"/>
+  <text class="mono on-c" x="316" y="37" text-anchor="middle">1.19</text>
+  <text class="sm" x="316" y="54" text-anchor="middle">atomic.Int64 等</text>
+
+  <circle class="dot-c" cx="410" cy="165" r="5"/><path class="ln-d" d="M410 160 V64"/>
+  <rect class="bx-c" x="370" y="20" width="96" height="44" rx="7"/>
+  <text class="mono on-c" x="418" y="37" text-anchor="middle">1.21</text>
+  <text class="sm" x="418" y="54" text-anchor="middle">OnceFunc 等</text>
+
+  <circle class="dot-c" cx="520" cy="165" r="5"/><path class="ln-d" d="M520 160 V64"/>
+  <rect class="bx-c" x="472" y="20" width="96" height="44" rx="7"/>
+  <text class="mono on-c" x="520" y="37" text-anchor="middle">1.23</text>
+  <text class="sm" x="520" y="54" text-anchor="middle">迭代器 · Timer</text>
+
+  <circle class="dot-c" cx="640" cy="165" r="5"/><path class="ln-d" d="M640 160 V64"/>
+  <rect class="bx-c" x="574" y="20" width="132" height="44" rx="7"/>
+  <text class="mono on-c" x="640" y="37" text-anchor="middle">1.25</text>
+  <text class="sm" x="640" y="54" text-anchor="middle">WaitGroup.Go·synctest</text>
+
+  <!-- 下方 -->
+  <circle class="dot-g" cx="150" cy="165" r="5"/><path class="ln-d" d="M150 170 V250"/>
+  <rect class="bx-g" x="96" y="250" width="108" height="44" rx="7"/>
+  <text class="mono on-g" x="150" y="267" text-anchor="middle">1.13</text>
+  <text class="sm" x="150" y="284" text-anchor="middle">%w · errors.Is/As</text>
+
+  <circle class="dot-g" cx="250" cy="165" r="5"/><path class="ln-d" d="M250 170 V250"/>
+  <rect class="bx-g" x="210" y="250" width="96" height="44" rx="7"/>
+  <text class="mono on-g" x="258" y="267" text-anchor="middle">1.18</text>
+  <text class="sm" x="258" y="284" text-anchor="middle">泛型 · any</text>
+
+  <circle class="dot-g" cx="355" cy="165" r="5"/><path class="ln-d" d="M355 170 V250"/>
+  <rect class="bx-g" x="312" y="250" width="100" height="44" rx="7"/>
+  <text class="mono on-g" x="362" y="267" text-anchor="middle">1.20</text>
+  <text class="sm" x="362" y="284" text-anchor="middle">WithCancelCause</text>
+
+  <circle class="dot-g" cx="465" cy="165" r="5"/><path class="ln-d" d="M465 170 V250"/>
+  <rect class="bx-g" x="418" y="250" width="100" height="44" rx="7"/>
+  <text class="mono on-g" x="468" y="267" text-anchor="middle">1.22</text>
+  <text class="sm" x="468" y="284" text-anchor="middle">循环变量语义</text>
+
+  <circle class="dot-g" cx="580" cy="165" r="5"/><path class="ln-d" d="M580 170 V250"/>
+  <rect class="bx-g" x="524" y="250" width="100" height="44" rx="7"/>
+  <text class="mono on-g" x="574" y="267" text-anchor="middle">1.24</text>
+  <text class="sm" x="574" y="284" text-anchor="middle">t.Context()</text>
+
+  <circle class="dot-g" cx="700" cy="165" r="5"/><path class="ln-d" d="M700 170 V250"/>
+  <rect class="bx-g" x="630" y="250" width="120" height="44" rx="7"/>
+  <text class="mono on-g" x="690" y="267" text-anchor="middle">1.26 / 1.27</text>
+  <text class="sm" x="690" y="284" text-anchor="middle">goroutine 泄漏分析</text>
+</svg>
+<figcaption>图 0-2　从本书的 Go 1.8 到写作这份笔记时的 Go 1.27，与并发相关的主要变化</figcaption>
+</figure>
+
+<h2 id="run">怎么运行书中的例子</h2>
+
+<p>仓库里每个 <code>fig-*.go</code> 都是一个可以单独运行的程序，<code>*_test.go</code> 是测试或基准测试。建议用最新版 Go，并且一定试试 <code>-race</code>：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+$ go version                      # 建议 Go 1.22 以上，最好是最新版
+$ mkdir play &amp;&amp; cd play &amp;&amp; go mod init play
+$ cp ../gos-concurrency-building-blocks/goroutines/fig-join-point.go main.go
+$ go run .                        # 运行
+$ go run -race .                  # 打开竞态检测器运行（第 1 章、附录 A）
+$ go vet .                        # 静态检查，能发现不少并发误用
+$ go test -bench=. -cpu=1 ./...   # 跑基准测试（第 3 章的上下文切换测试）
+</pre>
+</div>
+
+<div class="box trap">
+  <div class="t">&#9888; 运行老代码时会遇到的几个小问题</div>
+  <ul>
+    <li><code>go.mod</code> 里的 <code>go 1.xx</code> 版本号会改变语言语义：低于 1.22 时，第 3 章的「循环变量闭包」例子会重现书中的 bug；1.22 及以上则不会。</li>
+    <li>书中用到的 <code>io/ioutil</code> 已弃用（Go 1.16 起），请换成 <code>io.ReadAll</code>、<code>os.CreateTemp</code>。</li>
+    <li>仓库里 <code>pipelines_test.go</code> 和 <code>fig-goroutine-leaks-example.go</code> 的 <code>import ()</code> 是空的，需要自己补上 <code>testing</code>、<code>fmt</code>。</li>
+    <li>书中的随机数输出（如 <code>5577006791947779410</code>）是旧版 <code>math/rand</code> 固定种子的结果；Go 1.20 起全局随机源自动随机播种，你看到的数字会不一样。</li>
+  </ul>
+</div>
+
+<h2 id="toc">全部章节</h2>
+<div id="toc-grid"></div>
+
+<div class="box tip" style="margin-top:32px">
+  <div class="t">&#128161; 一句话总结</div>
+  <p>
+    如果只能记住一件事：<strong>每启动一个 goroutine，都要想清楚它在什么时候、因为什么而结束。</strong>
+    这本书剩下的内容 —— done 通道、通道所有权、管道、context、心跳 —— 几乎都是在回答这个问题。
+  </p>
+</div>
+
+<p style="font-size:13px;color:var(--fg-faint);margin-top:40px">
+  原书：Katherine Cox-Buday, <em>Concurrency in Go: Tools and Techniques for Developers</em>, O'Reilly, 2017。
+  示例代码以 MIT 协议发布（见仓库 LICENSE）。本笔记为学习用途的中文整理与补充。
+</p>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

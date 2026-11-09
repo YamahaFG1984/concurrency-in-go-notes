@@ -1,0 +1,1857 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 5 章 · 大规模并发 — Go 并发编程图解笔记</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="5">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 5 章</span>
+<h1>大规模并发</h1>
+<p class="lede">
+  学会了模式，接下来把模式再组合成「模式的模式」，用来构建大型、可组合、能扩展的系统。
+  这一章讨论在单个进程内扩展并发操作的方法，也开始涉及多个进程之间的并发：
+  错误该长什么样、怎样超时和取消、怎样知道一个 goroutine 还活着、怎样限流、以及怎样让卡死的 goroutine 自动重启。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>建立一套错误传播的框架：区分「bug」和「已知的边界情况」，在模块边界包装错误</li>
+    <li>知道何时该超时、何时会被取消，以及如何让长时间运行的代码可被抢占</li>
+    <li>用心跳监控 goroutine 的健康，并写出确定性的并发测试</li>
+    <li>理解复制请求的取舍</li>
+    <li>理解令牌桶限流算法，并用 <code>golang.org/x/time/rate</code> 组合多级限流</li>
+    <li>用「管家（steward）—被监护者（ward）」模式自动治愈不健康的 goroutine</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<!-- ============================================================ -->
+<h2 id="errors">错误传播</h2>
+
+<p>
+  在并发代码里，尤其是分布式系统里，出错很容易，搞清楚为什么出错却很难。仔细考虑问题怎样在系统中传播、最终怎样呈现给用户，
+  能为你、团队和用户省去大量痛苦。第 4 章「错误处理」讨论了怎样从 goroutine 里把错误传出来，但没讨论<strong>错误应该长什么样</strong>、
+  在大而复杂的系统里应该怎样流动。下面是作者一套有主见的框架。
+</p>
+
+<p>
+  很多开发者把错误传播当成「次要的」：精心设计数据怎样流动，错误却只是被容忍、被不假思索地沿栈往上扔，最后甩在用户面前。
+  Go 强制你在每一层处理错误，就是想纠正这个坏习惯。只要稍加思考，错误处理可以成为系统的资产，甚至让用户感到愉快。
+</p>
+
+<h3 id="err-what">一个错误应该包含什么</h3>
+
+<p>错误表示系统进入了一个无法完成用户（显式或隐式）请求的操作的状态。它需要传达几条关键信息：</p>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#10067;</span><h4>发生了什么</h4><p>比如「磁盘已满」「套接字已关闭」「凭证已过期」。通常由产生错误的东西隐式生成，你可以加上有助于用户理解的上下文。</p></div>
+  <div class="card"><span class="ic">&#128205;</span><h4>何时何地发生</h4><p>完整的栈跟踪（不要放在错误消息里，但要能取到）；运行的上下文，比如分布式系统里是哪台机器；以及错误创建时机器上的 UTC 时间。</p></div>
+  <div class="card"><span class="ic">&#128578;</span><h4>友好的用户消息</h4><p>针对你的系统和用户定制，只包含前两项中精简、相关的信息；以人为中心，说明问题是否是暂时的；最好只有一行。</p></div>
+  <div class="card"><span class="ic">&#128269;</span><h4>怎样获取更多信息</h4><p>给用户一个 ID，可以对照日志查看完整信息：错误发生（而非记录）的时间、栈跟踪……附上栈跟踪的哈希值还有助于在 bug 跟踪系统里归并同类问题。</p></div>
+</div>
+
+<p>
+  默认情况下，没有任何错误会自动包含这些信息。所以可以这样认为：<strong>任何没有这些信息就传到用户面前的错误，都是错误 —— 也就是 bug</strong>。
+  于是所有错误可以分成两类：
+</p>
+<ul>
+  <li><strong>Bug</strong>：没有针对你的系统定制过的「原始」错误；</li>
+  <li><strong>已知的边界情况</strong>：比如网络连接断开、磁盘写入失败，并且已经被包装成了格式良好的错误。</li>
+</ul>
+
+<p>
+  有时你会有意让边界情况的原始错误先暴露给用户，以便快速发布前几个版本；有时则是疏忽。但按这个思路，<strong>原始错误永远是 bug</strong>。
+  这个区分在决定怎样传播错误、系统怎样演进、最终给用户展示什么时都很有用。
+</p>
+
+<h3 id="err-boundary">在模块边界包装错误</h3>
+
+<p>设想一个有多个模块的大系统：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="错误从底层组件向上穿过中间组件到达用户界面，在每个模块边界被包装">
+  <rect class="bx-a" x="20" y="80" width="190" height="70" rx="12"/>
+  <text class="ttl on-a" x="115" y="108" text-anchor="middle">CLI 组件</text>
+  <text class="sm" x="115" y="130" text-anchor="middle">面向用户：决定展示什么</text>
+  <rect class="bx-p" x="285" y="80" width="190" height="70" rx="12"/>
+  <text class="ttl on-p" x="380" y="108" text-anchor="middle">中间组件</text>
+  <text class="sm" x="380" y="130" text-anchor="middle">intermediate</text>
+  <rect class="bx-b" x="550" y="80" width="190" height="70" rx="12"/>
+  <text class="ttl on-b" x="645" y="108" text-anchor="middle">底层组件</text>
+  <text class="sm" x="645" y="130" text-anchor="middle">lowlevel</text>
+  <path class="ln" d="M212 100 H281" marker-end="url(#ar)"/><text class="sm" x="246" y="92" text-anchor="middle">调用</text>
+  <path class="ln" d="M477 100 H546" marker-end="url(#ar)"/><text class="sm" x="511" y="92" text-anchor="middle">调用</text>
+  <path class="ln-r" d="M546 134 H479" marker-end="url(#ar-r)"/>
+  <path class="ln-r" d="M281 134 H214" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="511" y="168" text-anchor="middle">LowLevelErr</text>
+  <text class="sm on-r" x="246" y="168" text-anchor="middle">IntermediateErr</text>
+  <path class="ln-d" d="M247 40 V200 M512 40 V200"/>
+  <text class="lbl" x="247" y="30" text-anchor="middle">模块边界</text>
+  <text class="lbl" x="512" y="30" text-anchor="middle">模块边界</text>
+  <text class="sm" x="380" y="194" text-anchor="middle">规则：错误每穿过一个模块边界，都要被包装成「本模块的」格式良好的错误类型</text>
+  <text class="sm" x="380" y="214" text-anchor="middle">任何不是本模块错误类型的错误逃出了本模块 → 那就是 bug</text>
+</svg>
+<figcaption>图 5-1　模块边界是包装错误的地方</figcaption>
+</figure>
+
+<p>
+  假设「底层组件」里发生了错误，我们在那里构造了一个格式良好的错误往上传。在底层组件的上下文里它是格式良好的，但在整个系统的上下文里未必。
+  我们规定：<strong>在每个组件的边界，所有传入的错误都必须被包装成本组件的格式良好的错误</strong>。比如在「中间组件」里调用底层组件：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+func PostReport(id string) error {
+	result, err := lowlevel.DoWork()
+	if err != nil {
+		if _, ok := err.(lowlevel.Error); ok { // ① 确认收到的是格式良好的错误；如果不是，就原样往上传，以表明这是个 bug
+			err = WrapErr(err, "cannot post report with id %q", id) // ② 用本模块的信息包装，并赋予新类型；可能会隐藏一些对用户无关紧要的底层细节
+		}
+		return err
+	}
+	// ...
+}
+</pre>
+</div>
+
+<p>
+  错误根源的底层细节（哪个 goroutine、哪台机器、栈跟踪……）仍然在错误最初创建时就填好了，但我们的架构规定：在模块边界，把错误转换成本模块的错误类型。
+  现在，任何没有本模块错误类型就逃出本模块的错误，都可以被视为<strong>格式不良</strong>，也就是 bug。
+  注意只需要在<strong>自己的模块边界（公共函数/方法）</strong>或能补充有价值上下文时包装，大部分代码不需要这么做。
+</p>
+
+<p>
+  这让系统能够<strong>有机地成长</strong>：我们可以确信传入的错误格式良好，也会认真考虑错误怎样逃出自己的模块。「错误正确性」成了系统的一种涌现属性。
+  我们一开始就承认不完美，明确地处理格式不良的错误，由此获得了一个随时间发现并纠正错误的框架。
+</p>
+
+<p>展示给用户时，这个区分就派上用场了：</p>
+<ul>
+  <li>收到<strong>格式良好</strong>的错误：可以确信每一层都认真构造了消息，直接记日志、展示给用户即可；</li>
+  <li>收到<strong>格式不良</strong>的错误（bug）：也要记日志，但给用户展示一条友好的「发生了意外」的消息；如果支持自动错误上报，就当作 bug 报告；否则建议用户提交 bug。</li>
+</ul>
+<p>无论哪种情况，消息里都要带一个日志 ID，好奇的用户可以据此查看完整信息。</p>
+
+<h3 id="err-example">完整示例</h3>
+
+<p>先定义一个能容纳格式良好错误所有要素的类型：</p>
+
+<div class="code" data-lang="go" data-file="error-propagation/fig-error-propagation.go（节选）">
+<pre>
+type MyError struct {
+	Inner      error                  // ① 被包装的错误：我们总想能回溯到最底层的错误
+	Message    string
+	StackTrace string                 // ② 错误创建时的栈跟踪
+	Misc       map[string]interface{} // ③ 杂项：并发 ID、栈跟踪的哈希、其他有助于诊断的上下文
+}
+
+func wrapError(err error, messagef string, msgArgs ...interface{}) MyError {
+	return MyError{
+		Inner:      err,
+		Message:    fmt.Sprintf(messagef, msgArgs...),
+		StackTrace: string(debug.Stack()),
+		Misc:       make(map[string]interface{}),
+	}
+}
+
+func (err MyError) Error() string {
+	return err.Message
+}
+</pre>
+</div>
+
+<div class="code" data-lang="go">
+<pre>
+// "lowlevel" 模块
+
+type LowLevelErr struct {
+	error
+}
+
+func isGloballyExec(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, LowLevelErr{(wrapError(err, err.Error()))} // ① 包装 os.Stat 的原始错误；这里沿用原消息，不打算隐藏
+	}
+	return info.Mode().Perm()&amp;0100 == 0100, nil
+}
+</pre>
+</div>
+
+<div class="code" data-lang="go" data-tone="bad" data-file="✗ intermediate 模块（有 bug 的版本）">
+<pre>
+// "intermediate" 模块
+
+type IntermediateErr struct {
+	error
+}
+
+func runJob(id string) error {
+	const jobBinPath = "/bad/job/binary"
+	isExecutable, err := isGloballyExec(jobBinPath)
+	if err != nil {
+		return err // ① 直接把 lowlevel 的错误传出去了 —— 按我们的约定，这是个 bug
+	} else if isExecutable == false {
+		return wrapError(nil, "job binary is not executable")
+	}
+
+	return exec.Command(jobBinPath, "--id="+id).Run()
+}
+</pre>
+</div>
+
+<div class="code" data-lang="go">
+<pre>
+func handleError(key int, err error, message string) {
+	log.SetPrefix(fmt.Sprintf("[logID: %v]: ", key))
+	log.Printf("%#v", err) // ③ 把完整的错误记进日志，供需要时深挖
+	fmt.Printf("[%v] %v", key, message)
+}
+
+func main() {
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.Ltime | log.LUTC)
+
+	err := runJob("1")
+	if err != nil {
+		msg := "There was an unexpected issue; please report this as a bug."
+		if _, ok := err.(IntermediateErr); ok { // ① 是期望的类型，说明是精心构造的错误，直接把消息给用户
+			msg = err.Error()
+		}
+		handleError(1, err, msg) // ② 用 ID 1 把日志和错误消息绑在一起（实际可以递增或用 GUID）
+	}
+}
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="日志（节选）与用户看到的消息">
+<pre>
+[logID: 1]: 21:46:07 main.LowLevelErr{error:main.MyError{Inner:(*os.PathError)(0xc4200123f0),
+Message:"stat /bad/job/binary: no such file or directory", StackTrace:"goroutine 1 [running]: ..."}}
+
+[1] There was an unexpected issue; please report this as a bug.
+</pre>
+</div>
+
+<p>
+  错误在传播路径上某处没被正确处理，我们无法确定它的消息适合给人看，所以只打印「发生了意外」。回头看 intermediate 模块就知道原因：没有包装 lowlevel 的错误。修正它：
+</p>
+
+<div class="code" data-lang="go" data-file="error-propagation/fig-error-propagation-corrected.go（节选）">
+<pre>
+func runJob(id string) error {
+	const jobBinPath = "/bad/job/binary"
+	isExecutable, err := isGloballyExec(jobBinPath)
+	if err != nil {
+		return IntermediateErr{wrapError( // ① 用精心构造的消息定制错误；这里故意隐藏了底层细节，因为对本模块的调用者不重要
+			err,
+			"cannot run job %q: requisite binaries not available",
+			id,
+		)}
+	} else if isExecutable == false {
+		return wrapError(
+			nil,
+			"cannot run job %q: requisite binaries are not executable",
+			id,
+		)
+	}
+
+	return exec.Command(jobBinPath, "--id="+id).Run()
+}
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="用户看到的消息">
+<pre>
+[1] cannot run job "1": requisite binaries not available
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="修正后的错误层层包装结构">
+  <rect class="bx-p" x="20" y="20" width="720" height="184" rx="14"/>
+  <text class="ttl on-p" x="40" y="44">IntermediateErr</text>
+  <text class="sm" x="200" y="44">消息：cannot run job "1": requisite binaries not available　← 给用户看的</text>
+  <rect class="bx" x="44" y="58" width="672" height="132" rx="12"/>
+  <text class="ttl" x="64" y="80">MyError（中间层）</text><text class="sm" x="230" y="80">+ 栈跟踪 + Misc</text>
+  <rect class="bx-b" x="68" y="92" width="624" height="86" rx="10"/>
+  <text class="ttl on-b" x="88" y="114">LowLevelErr → MyError（底层）</text><text class="sm" x="330" y="114">+ 栈跟踪：错误最初发生的地方</text>
+  <rect class="bx-r" x="92" y="126" width="576" height="40" rx="8"/>
+  <text class="mono on-r" x="380" y="151" text-anchor="middle">*os.PathError: stat /bad/job/binary: no such file or directory</text>
+</svg>
+<figcaption>图 5-2　一层套一层：外层给用户看，内层留给排查问题的人</figcaption>
+</figure>
+
+<p>
+  这个技巧是<strong>渐进式</strong>的：你可以先在顶层错误处理处区分 bug 和精心构造的错误，然后逐步确保自己创建的所有错误都是精心构造的。
+  书中推荐了当时流行的 <code>github.com/pkg/errors</code> 包来实现。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：标准库的错误包装 <span class="ver">Go 1.13+</span><span class="ver">Go 1.20+</span><span class="ver">Go 1.26+</span></div>
+  <p>
+    书中依赖第三方包和类型断言。Go 1.13 起，标准库提供了错误包装：<code>fmt.Errorf("...: %w", err)</code> 包装、<code>errors.Unwrap</code> 解包、
+    <code>errors.Is</code> 比较哨兵错误、<code>errors.As</code> 沿着包装链查找某种类型。<code>github.com/pkg/errors</code> 已归档，不再推荐。
+    关键区别：<strong>类型断言 <code>err.(IntermediateErr)</code> 只检查最外层</strong>，一旦别人用 <code>%w</code> 再包一层就失效；<code>errors.As</code> 会遍历整条链。
+  </p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="新写法">
+<pre>
+type MyError struct {
+	Inner      error
+	Message    string
+	StackTrace string
+	Misc       map[string]any
+}
+
+func (e MyError) Error() string { return e.Message }
+func (e MyError) Unwrap() error { return e.Inner } // 让 errors.Is/As 能看穿这一层
+
+// 顶层：沿包装链查找，而不是只断言最外层
+var ierr IntermediateErr
+if errors.As(err, &amp;ierr) {
+	msg = ierr.Error()
+}
+// Go 1.26+ 的泛型写法：
+if ierr, ok := errors.AsType[IntermediateErr](err); ok {
+	msg = ierr.Error()
+}
+
+// 结构化日志（Go 1.21+ log/slog），日志 ID 作为字段，方便检索
+slog.Error("job failed", "logID", logID, "err", err, "stack", stack)
+</pre>
+  </div>
+  <p>此外 <span class="ver">Go 1.20</span> 的 <code>errors.Join</code> 和 <code>%w</code> 多次使用，可以把多个错误合并成一个，适合「并发任务各自出错」的场景。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="timeouts">超时与取消</h2>
+
+<p>
+  写并发代码时，超时和取消会频繁出现。超时对于构建「行为可以被理解」的系统至关重要；取消是对超时的一种自然反应，也可能有其他原因。
+</p>
+
+<h3 id="why-timeout">为什么要支持超时</h3>
+
+<dl class="terms">
+  <dt>系统饱和</dt>
+  <dd>
+    如第 4 章「队列」所述，系统处理能力到达上限时，可能希望边缘的请求超时，而不是花很久去处理。一般在以下情况选择超时：请求超时后不太可能被重复发送；
+    没有资源存储请求（内存队列的内存、持久化队列的磁盘）；请求的需求或数据会过期。如果请求很可能被重复，系统会因为不断接受和超时请求而产生开销，开销超过容量就可能导致死亡螺旋。
+  </dd>
+  <dt>数据过期</dt>
+  <dd>
+    有时数据必须在某个时间窗口内处理，过了窗口就有更新的数据，或者不再需要处理。如果窗口事先已知，就给并发进程传一个 <code>context.WithDeadline</code> 或 <code>WithTimeout</code> 创建的 context；
+    如果事先未知，就让父亲在不再需要时用 <code>context.WithCancel</code> 取消它。
+  </dd>
+  <dt>防止死锁</dt>
+  <dd>
+    在大型系统（尤其分布式系统）里，有时很难理解数据怎样流动、会出现什么边界情况。给所有并发操作都加上超时以保证不会死锁，是合理甚至推荐的做法。
+    超时时长不必接近操作的实际耗时，只要短到死锁的系统能在可接受的时间内解锁。不过要注意：用超时避免死锁，可能把死锁变成活锁。但在大系统里，
+    下一次的时序不太可能和上次完全一样，所以宁可冒活锁的风险、有空再修，也比发生只能重启才能恢复的死锁好。这不是「正确构建系统」的方法，而是让系统能容忍你在开发测试时没覆盖到的时序错误；目标仍然应该是收敛到一个从不触发超时的无死锁系统。
+  </dd>
+</dl>
+
+<h3 id="why-cancel">并发进程为什么会被取消</h3>
+
+<div class="cards">
+  <div class="card"><h4>超时</h4><p>超时是一种隐式的取消。</p></div>
+  <div class="card"><h4>用户干预</h4><p>长时间运行的操作，通常要允许用户取消他们发起的操作。</p></div>
+  <div class="card"><h4>父级取消</h4><p>并发操作的任何一种「父亲」停止了，作为孩子的我们也会被取消。</p></div>
+  <div class="card"><h4>复制请求</h4><p>把请求发给多个处理者，第一个返回后取消其余的（本章后面详述）。</p></div>
+</div>
+
+<h3 id="preemptable">让代码可被抢占</h3>
+
+<p>
+  「为什么取消」不难，难的是「怎样取消」：当并发进程被取消时，正在执行的算法和下游消费者会怎样？写可以随时被终止的并发代码，要考虑什么？
+  首先是并发进程的<strong>可抢占性</strong>。假设下面的代码运行在自己的 goroutine 里：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+var value interface{}
+select {
+case &lt;-done:
+	return
+case value = &lt;-valueStream:
+}
+
+result := reallyLongCalculation(value) // 这一步没法被打断！
+
+select {
+case &lt;-done:
+	return
+case resultStream &lt;- result:
+}
+</pre>
+</div>
+
+<p>
+  我们尽职地把读和写都和 done 放进了 select，但 <code>reallyLongCalculation</code> 看起来不可抢占，而且从名字看会跑很久。
+  如果在它执行时有人取消这个 goroutine，可能要过很久才会响应取消。试着让它可抢占：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+reallyLongCalculation := func(
+	done &lt;-chan interface{},
+	value interface{},
+) interface{} {
+	intermediateResult := longCalculation(value)
+	select {
+	case &lt;-done:
+		return nil
+	default:
+	}
+
+	return longCalculation(intermediateResult)
+}
+</pre>
+</div>
+
+<p>只解决了一半：只能在两次 <code>longCalculation</code> 之间被抢占。要彻底解决，<code>longCalculation</code> 本身也得可抢占：</p>
+
+<div class="code" data-lang="go">
+<pre>
+reallyLongCalculation := func(
+	done &lt;-chan interface{},
+	value interface{},
+) interface{} {
+	intermediateResult := longCalculation(done, value)
+	return longCalculation(done, intermediateResult)
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="检查 done 的间隔决定了响应取消的最长延迟">
+  <text class="ttl" x="20" y="24">取消信号到达 → 实际停下，最多要等多久？</text>
+  <text class="lbl" x="20" y="66">不可抢占</text>
+  <rect class="bx-r" x="130" y="50" width="560" height="26" rx="5"/><text class="sm on-r" x="410" y="68" text-anchor="middle">reallyLongCalculation（整段都无法打断）</text>
+  <path class="ln-a" d="M260 40 V86"/><text class="sm on-a" x="266" y="46">取消</text>
+  <text class="sm on-r" x="694" y="68">← 等到这</text>
+
+  <text class="lbl" x="20" y="116">中间检查一次</text>
+  <rect class="bx-y" x="130" y="100" width="280" height="26" rx="5"/><text class="sm on-y" x="270" y="118" text-anchor="middle">longCalculation</text>
+  <circle class="dot-g" cx="410" cy="113" r="6"/>
+  <rect class="bx-y" x="416" y="100" width="274" height="26" rx="5"/><text class="sm on-y" x="553" y="118" text-anchor="middle">longCalculation</text>
+  <path class="ln-a" d="M260 92 V136"/>
+
+  <text class="lbl" x="20" y="166">层层可抢占</text>
+  <g>
+    <rect class="bx-g" x="130" y="150" width="66" height="26" rx="5"/><circle class="dot-g" cx="200" cy="163" r="4"/>
+    <rect class="bx-g" x="204" y="150" width="66" height="26" rx="5"/><circle class="dot-g" cx="274" cy="163" r="4"/>
+    <rect class="bx-g" x="278" y="150" width="66" height="26" rx="5"/><circle class="dot-g" cx="348" cy="163" r="4"/>
+    <rect class="bx-g" x="352" y="150" width="66" height="26" rx="5"/><circle class="dot-g" cx="422" cy="163" r="4"/>
+    <rect class="bx-g" x="426" y="150" width="66" height="26" rx="5"/><circle class="dot-g" cx="496" cy="163" r="4"/>
+    <rect class="bx-g" x="500" y="150" width="66" height="26" rx="5"/><circle class="dot-g" cx="570" cy="163" r="4"/>
+    <rect class="bx-g" x="574" y="150" width="116" height="26" rx="5"/>
+  </g>
+  <path class="ln-a" d="M260 142 V186"/>
+  <text class="sm on-g" x="274" y="200" text-anchor="middle">很快就停下</text>
+  <text class="sm" x="560" y="200" text-anchor="middle">绿点 = 检查 done / ctx.Done() 的位置</text>
+</svg>
+<figcaption>图 5-3　可抢占的粒度：所有不可抢占的原子操作都应该在你能接受的时间内完成</figcaption>
+</figure>
+
+<div class="box key">
+  <div class="t">&#9733; 可抢占性的两条原则</div>
+  <ol>
+    <li>定义并发进程可被抢占的<strong>时间周期</strong>；</li>
+    <li>确保任何耗时超过这个周期的功能，本身也是可抢占的。简单的做法是把 goroutine 拆成更小的片段，让每个不可抢占的原子操作都能在这个周期内完成。</li>
+  </ol>
+</div>
+
+<h3 id="rollback">被取消时，共享状态怎么办？</h3>
+
+<p>
+  还有一个潜在问题：如果 goroutine 修改了共享状态（数据库、文件、内存数据结构），被取消时怎么办？要回滚已做的中间工作吗？有多长时间做回滚？
+  很难给出通用建议，但如果<strong>把对共享状态的修改限制在很小的范围内、并且容易回滚</strong>，通常就能很好地处理取消。尽可能在内存里构建中间结果，然后尽快修改状态。错误的做法：
+</p>
+
+<div class="vs">
+  <div class="old"><div class="h">✗ 写三次状态</div>
+<div class="code" data-lang="go"><pre>
+result := add(1, 2, 3)
+writeTallyToState(result)
+result = add(result, 4, 5, 6)
+writeTallyToState(result)
+result = add(result, 7, 8, 9)
+writeTallyToState(result)
+</pre></div></div>
+  <div class="new"><div class="h">✓ 在内存里算完，只写一次</div>
+<div class="code" data-lang="go"><pre>
+result := add(1, 2, 3, 4, 5, 6, 7, 8, 9)
+writeTallyToState(result)
+</pre></div></div>
+</div>
+
+<p>左边如果在最后一次写之前被取消，就得设法回滚前两次写入；右边需要担心回滚的面积小得多。</p>
+
+<h3 id="duplicates">重复消息</h3>
+
+<p>
+  另一个要关心的问题是<strong>重复消息</strong>。假设管道有三个阶段：生成器、阶段 A、阶段 B。生成器通过记录距上次从 A 读取过了多久来监控 A，
+  如果 A 表现不佳就启动一个新实例 A2。这时 B 可能收到重复的消息：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="取消信号在阶段 A 已经发出结果之后才到达，导致阶段 B 收到重复消息；以及向父级请求许可的方案">
+  <text class="ttl" x="190" y="22" text-anchor="middle">问题：B 收到重复消息</text>
+  <text class="ttl" x="575" y="22" text-anchor="middle">方案之一：先问父亲能不能发</text>
+  <path class="ln-d" d="M385 12 V280"/>
+  <!-- 左 -->
+  <text class="sm" x="60" y="48" text-anchor="middle">生成器</text><text class="sm" x="150" y="48" text-anchor="middle">A</text>
+  <text class="sm" x="240" y="48" text-anchor="middle">A2</text><text class="sm" x="330" y="48" text-anchor="middle">B</text>
+  <path class="ln-d" d="M60 56 V270 M150 56 V270 M240 56 V270 M330 56 V270"/>
+  <path class="ln" d="M60 80 H146" marker-end="url(#ar)"/><text class="sm" x="104" y="74" text-anchor="middle">值</text>
+  <text class="sm on-y" x="150" y="104" text-anchor="middle">处理得很慢…</text>
+  <path class="ln-a" d="M60 124 H236" marker-end="url(#ar-a)"/><text class="sm on-a" x="148" y="118" text-anchor="middle">启动 A2，重发同一个值</text>
+  <path class="ln-g" d="M150 150 H326" marker-end="url(#ar-g)"/><text class="sm on-g" x="238" y="144" text-anchor="middle">A 恰好完成，发出结果</text>
+  <path class="ln-r" d="M60 176 H146" marker-end="url(#ar-r)"/><text class="sm on-r" x="104" y="170" text-anchor="middle">取消 A（晚了）</text>
+  <path class="ln-g" d="M240 210 H326" marker-end="url(#ar-g)"/><text class="sm on-g" x="283" y="204" text-anchor="middle">A2 也发出</text>
+  <text class="sm on-r" x="330" y="240" text-anchor="middle">⚠ 收到两次</text>
+  <!-- 右 -->
+  <text class="sm" x="450" y="48" text-anchor="middle">父（生成器）</text><text class="sm" x="580" y="48" text-anchor="middle">A</text><text class="sm" x="700" y="48" text-anchor="middle">B</text>
+  <path class="ln-d" d="M450 56 V270 M580 56 V270 M700 56 V270"/>
+  <path class="ln" d="M450 80 H576" marker-end="url(#ar)"/><text class="sm" x="515" y="74" text-anchor="middle">值</text>
+  <path class="ln-b" d="M580 120 H454" marker-end="url(#ar-b)"/><text class="sm on-b" x="515" y="114" text-anchor="middle">我能发给 B 吗？</text>
+  <path class="ln-b" d="M450 156 H576" marker-end="url(#ar-b)"/><text class="sm on-b" x="515" y="150" text-anchor="middle">可以</text>
+  <path class="ln-g" d="M580 192 H696" marker-end="url(#ar-g)"/><text class="sm on-g" x="640" y="186" text-anchor="middle">发出结果</text>
+  <text class="sm" x="575" y="236" text-anchor="middle">显式请求许可，比心跳更安全，</text>
+  <text class="sm" x="575" y="254" text-anchor="middle">但更复杂，实践中很少需要</text>
+</svg>
+<figcaption>图 5-4　重复消息的成因（重绘自原书图 5-1、5-2）</figcaption>
+</figure>
+
+<p>避免重复消息的办法：</p>
+<ul>
+  <li><strong>（推荐）</strong>让「孩子已经报告结果之后、父亲才发出取消」变得几乎不可能发生。这需要阶段之间的双向通信，下一节「心跳」会详细讲。</li>
+  <li><strong>接受第一个或最后一个结果</strong>：如果算法允许，或者并发进程是幂等的，可以允许下游收到重复消息，自己决定取第一个还是最后一个。</li>
+  <li><strong>向父 goroutine 请求许可</strong>：如图 5-4 右侧，用双向通信显式地请求发送许可。比心跳更安全，但更复杂，作者建议直接用心跳。</li>
+</ul>
+
+<div class="box tip">
+  <div class="t">&#10003; 一开始就考虑超时和取消</div>
+  <p>设计并发进程时一定要考虑超时和取消。和软件工程的许多话题一样，一开始忽略、之后再加，就像蛋糕烤好了才想起来加鸡蛋。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="heartbeats">心跳（Heartbeats）</h2>
+
+<p>
+  心跳是并发进程向外界<strong>发出「我还活着」信号</strong>的方式，名字来自人体：心跳表示生命。心跳在 Go 之前就有了，在 Go 里依然有用。
+  它让我们能洞察系统的状态，还能让原本不确定的测试变得确定。本节讨论两种心跳：
+</p>
+<ul>
+  <li><strong>按时间间隔发出的心跳</strong>；</li>
+  <li><strong>在每个工作单元开始时发出的心跳</strong>。</li>
+</ul>
+
+<h3 id="interval-hb">按时间间隔的心跳</h3>
+
+<p>
+  适用于「在等别的东西发生才能处理一个工作单元」的并发代码：你不知道工作什么时候来，goroutine 可能要闲坐一会儿。心跳是向监听者表明「一切正常，安静是预期中的」。
+</p>
+
+<div class="code" data-lang="go" data-file="heartbeats/fig-interval-heartbeat.go（节选）">
+<pre>
+doWork := func(
+	done &lt;-chan interface{},
+	pulseInterval time.Duration,
+) (&lt;-chan interface{}, &lt;-chan time.Time) {
+	heartbeat := make(chan interface{}) // ① 发心跳的通道，返回给调用者
+	results := make(chan time.Time)
+	go func() {
+		defer close(heartbeat)
+		defer close(results)
+
+		pulse := time.Tick(pulseInterval)       // ② 每隔 pulseInterval 跳一次
+		workGen := time.Tick(2 * pulseInterval) // ③ 模拟工作到来，间隔比心跳长，好看到心跳
+
+		sendPulse := func() {
+			select {
+			case heartbeat &lt;- struct{}{}:
+			default: // ④ 一定要有 default：可能没人在听心跳。结果很重要，心跳不重要
+			}
+		}
+		sendResult := func(r time.Time) {
+			for {
+				select {
+				case &lt;-done:
+					return
+				case &lt;-pulse: // ⑤ 和 done 一样：任何收发操作都要同时照顾心跳
+					sendPulse()
+				case results &lt;- r:
+					return
+				}
+			}
+		}
+
+		for {
+			select {
+			case &lt;-done:
+				return
+			case &lt;-pulse: // ⑤
+				sendPulse()
+			case r := &lt;-workGen:
+				sendResult(r)
+			}
+		}
+	}()
+	return heartbeat, results
+}
+</pre>
+</div>
+
+<p>因为等输入时、等发送结果时都可能要发出多次心跳，所有 select 都要放在 for 循环里。消费方这样用：</p>
+
+<div class="code" data-lang="go">
+<pre>
+done := make(chan interface{})
+time.AfterFunc(10*time.Second, func() { close(done) }) // ① 10 秒后关闭 done，给 goroutine 时间干点活
+
+const timeout = 2 * time.Second                // ② 超时时间
+heartbeat, results := doWork(done, timeout/2) // ③ 心跳间隔取超时的一半，多给一次机会，避免太敏感
+for {
+	select {
+	case _, ok := &lt;-heartbeat: // ④ 没有结果时，至少每 timeout/2 收到一次心跳；收不到说明 goroutine 本身出了问题
+		if ok == false {
+			return
+		}
+		fmt.Println("pulse")
+	case r, ok := &lt;-results: // ⑤ 正常接收结果
+		if ok == false {
+			return
+		}
+		fmt.Printf("results %v\n", r.Second())
+	case &lt;-time.After(timeout): // ⑥ 既没心跳也没结果，超时
+		return
+	}
+}
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出：大约每两次心跳一个结果">
+<pre>
+pulse
+pulse
+results 52
+pulse
+pulse
+results 54
+...
+</pre>
+</div>
+
+<p>
+  在正常运行的系统里，心跳没什么意思，也许可以用来统计空闲时间。但当 goroutine <strong>行为异常</strong>时，按间隔的心跳就大放异彩了。
+  下面模拟一个写错了的 goroutine：只循环两次就停止（相当于 panic），而且没关闭任何通道：
+</p>
+
+<div class="code" data-lang="go" data-file="heartbeats/fig-interval-heartbeat-misbehaving-goroutine.go（节选）">
+<pre>
+for i := 0; i &lt; 2; i++ { // ① 模拟出 bug：不是无限循环，只循环两次就退出，也不关闭通道
+	select {
+	case &lt;-done:
+		return
+	case &lt;-pulse:
+		sendPulse()
+	case r := &lt;-workGen:
+		sendResult(r)
+	}
+}
+
+// 消费方的超时分支改为：
+case &lt;-time.After(timeout):
+	fmt.Println("worker goroutine is not healthy!")
+	return
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+pulse
+pulse
+worker goroutine is not healthy!
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="心跳时间线：健康时定期收到心跳，异常时心跳中断触发超时">
+  <text class="ttl on-g" x="20" y="28">健康的 goroutine</text>
+  <path class="ln" d="M130 60 H730" marker-end="url(#ar)"/>
+  <circle class="dot-g" cx="190" cy="60" r="7"/><circle class="dot-g" cx="250" cy="60" r="7"/>
+  <rect class="bx-b" x="296" y="48" width="28" height="24" rx="5"/>
+  <circle class="dot-g" cx="370" cy="60" r="7"/><circle class="dot-g" cx="430" cy="60" r="7"/>
+  <rect class="bx-b" x="476" y="48" width="28" height="24" rx="5"/>
+  <circle class="dot-g" cx="550" cy="60" r="7"/><circle class="dot-g" cx="610" cy="60" r="7"/>
+  <rect class="bx-b" x="656" y="48" width="28" height="24" rx="5"/>
+  <text class="sm" x="130" y="92">● 心跳（每 1s）　■ 结果（每 2s）　监听方：超过 2s 什么都没收到才算异常</text>
+
+  <text class="ttl on-r" x="20" y="134">异常的 goroutine</text>
+  <path class="ln" d="M130 166 H730" marker-end="url(#ar)"/>
+  <circle class="dot-g" cx="190" cy="166" r="7"/><circle class="dot-g" cx="250" cy="166" r="7"/>
+  <text class="sm on-r" x="270" y="150">goroutine 悄悄退出（通道没关闭）</text>
+  <rect class="bx-r" x="250" y="156" width="120" height="20" rx="4" style="opacity:.7"/>
+  <text class="sm on-r" x="310" y="170" text-anchor="middle">2s 内无任何信号</text>
+  <path class="ln-r" d="M370 150 V182"/>
+  <text class="ttl on-r" x="380" y="200">→ "worker goroutine is not healthy!"</text>
+  <text class="sm" x="380" y="220">2 秒内就发现问题，既避免了死锁，又不必依赖很长的超时</text>
+</svg>
+<figcaption>图 5-5　按间隔的心跳：沉默是正常的，但「连心跳都没了」就是故障</figcaption>
+</figure>
+
+<p>
+  漂亮！两秒内系统就意识到 goroutine 出了问题，打破了 for-select 循环。用心跳成功避免了死锁，而且不需要依赖更长的超时，保持了确定性。
+  反过来，心跳也能告诉我们：长时间运行的 goroutine 还活着，只是在花时间产出下一个值。本章「自愈」一节会进一步发展这个概念。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：书中 <code>time.Tick</code> 的用法今天是安全的 <span class="ver">Go 1.23+</span></div>
+  <p>
+    在 goroutine 里调用 <code>time.Tick</code>，旧版本中 goroutine 退出后底层 Ticker 永远不会被回收（泄漏）。Go 1.23 起不再被引用的 Ticker 会被 GC 回收，书中写法不再泄漏。
+    不过需要显式停止时，<code>t := time.NewTicker(d); defer t.Stop()</code> 依然是更清晰的写法。
+  </p>
+</div>
+
+<h3 id="unit-hb">每个工作单元开始时的心跳</h3>
+
+<p>这种心跳对<strong>测试</strong>特别有用：</p>
+
+<div class="code" data-lang="go" data-file="heartbeats/fig-work-unit-pulse.go（节选）">
+<pre>
+doWork := func(done &lt;-chan interface{}) (&lt;-chan interface{}, &lt;-chan int) {
+	heartbeatStream := make(chan interface{}, 1) // ① 缓冲为 1：即使暂时没人听，也至少能发出一次心跳
+	workStream := make(chan int)
+	go func() {
+		defer close(heartbeatStream)
+		defer close(workStream)
+
+		for i := 0; i &lt; 10; i++ {
+			select { // ② 心跳单独一个 select：如果和发送结果放在一起，接收方没准备好时可能收到心跳而不是结果，当前结果就丢了
+			case heartbeatStream &lt;- struct{}{}:
+			default: // ③ 同样防止没人听；因为有 1 个缓冲，监听者来晚了也能知道有过一次心跳
+			}
+
+			select {
+			case &lt;-done:
+				return
+			case workStream &lt;- rand.Intn(10):
+			}
+		}
+	}()
+	return heartbeatStream, workStream
+}
+</pre>
+</div>
+
+<p>运行后每个结果前都有一个 <code>pulse</code>。这种技巧真正闪光的地方在测试里。看这个函数：</p>
+
+<div class="code" data-lang="go" data-file="heartbeats/dowork_test.go">
+<pre>
+func DoWork(
+	done &lt;-chan interface{},
+	nums ...int,
+) (&lt;-chan interface{}, &lt;-chan int) {
+	heartbeat := make(chan interface{}, 1)
+	intStream := make(chan int)
+	go func() {
+		defer close(heartbeat)
+		defer close(intStream)
+
+		time.Sleep(2 * time.Second) // ① 模拟开始工作前的某种延迟：CPU 负载、磁盘争用、网络延迟……还有「小妖精」
+
+		for _, n := range nums {
+			select {
+			case heartbeat &lt;- struct{}{}:
+			default:
+			}
+
+			select {
+			case &lt;-done:
+				return
+			case intStream &lt;- n:
+			}
+		}
+	}()
+	return heartbeat, intStream
+}
+</pre>
+</div>
+
+<p>一个糟糕的测试：</p>
+
+<div class="code" data-lang="go" data-tone="bad" data-file="✗ heartbeats/bad_concurrent_test.go">
+<pre>
+func TestDoWork_GeneratesAllNumbers(t *testing.T) {
+	done := make(chan interface{})
+	defer close(done)
+
+	intSlice := []int{0, 1, 2, 3, 5}
+	_, results := DoWork(done, intSlice...)
+
+	for i, expected := range intSlice {
+		select {
+		case r := &lt;-results:
+			if r != expected {
+				t.Errorf("index %v: expected %v, but received %v,", i, expected, r)
+			}
+		case &lt;-time.After(1 * time.Second): // ① 「合理」的超时，防止坏掉的 goroutine 让测试死锁
+			t.Fatal("test timed out")
+		}
+	}
+}
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+--- FAIL: TestDoWork_GeneratesAllNumbers (1.00s)
+    bad_concurrent_test.go:46: test timed out
+FAIL
+</pre>
+</div>
+
+<p>
+  这个测试糟糕在于它<strong>不确定</strong>。例子里作者故意让它一定失败，但如果去掉 <code>time.Sleep</code>，情况反而更糟：<strong>有时通过，有时失败</strong>。
+  进程外的因素会让 goroutine 迟迟进不了第一次迭代，甚至它什么时候被调度都不确定。我们没法保证第一次迭代在超时之前发生，于是开始用概率思考：
+  这个超时有多大可能被触发？加大超时意味着失败时要等很久，拖慢整个测试套件。
+</p>
+
+<p>
+  这是非常糟糕的处境：团队不再信任测试失败，开始忽略它们，整个努力开始瓦解。幸好心跳能轻松解决：
+</p>
+
+<div class="code" data-lang="go" data-file="heartbeats/concurrent_test.go">
+<pre>
+func TestDoWork_GeneratesAllNumbers(t *testing.T) {
+	done := make(chan interface{})
+	defer close(done)
+
+	intSlice := []int{0, 1, 2, 3, 5}
+	heartbeat, results := DoWork(done, intSlice...)
+
+	&lt;-heartbeat // ① 等 goroutine 发出「我开始处理了」的信号
+
+	i := 0
+	for r := range results {
+		if expected := intSlice[i]; r != expected {
+			t.Errorf("index %v: expected %v, but received %v,", i, expected, r)
+		}
+		i++
+	}
+}
+// ok  command-line-arguments 2.002s
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="不可靠的超时测试与基于心跳的确定性测试对比">
+  <text class="ttl on-r" x="20" y="26">✗ 靠超时：赌 goroutine 在 1 秒内开始</text>
+  <path class="ln" d="M60 60 H720" marker-end="url(#ar)"/>
+  <rect class="bx-y" x="60" y="48" width="280" height="24" rx="5"/><text class="sm on-y" x="200" y="65" text-anchor="middle">启动延迟（不确定：0.1s？2s？）</text>
+  <path class="ln-r" d="M200 40 V84"/><text class="sm on-r" x="206" y="96">1s 超时：测试失败（但代码没错！）</text>
+
+  <text class="ttl on-g" x="20" y="130">✓ 靠心跳：先等「开始了」，再检查结果</text>
+  <path class="ln" d="M60 164 H720" marker-end="url(#ar)"/>
+  <rect class="bx-y" x="60" y="152" width="280" height="24" rx="5"/><text class="sm on-y" x="200" y="169" text-anchor="middle">启动延迟（多长都无所谓）</text>
+  <circle class="dot-g" cx="346" cy="164" r="7"/><text class="sm on-g" x="346" y="194" text-anchor="middle">&lt;-heartbeat</text>
+  <rect class="bx-b" x="360" y="152" width="44" height="24" rx="5"/><text class="sm on-b" x="382" y="169" text-anchor="middle">0</text>
+  <rect class="bx-b" x="408" y="152" width="44" height="24" rx="5"/><text class="sm on-b" x="430" y="169" text-anchor="middle">1</text>
+  <rect class="bx-b" x="456" y="152" width="44" height="24" rx="5"/><text class="sm on-b" x="478" y="169" text-anchor="middle">2</text>
+  <rect class="bx-b" x="504" y="152" width="44" height="24" rx="5"/><text class="sm on-b" x="526" y="169" text-anchor="middle">3</text>
+  <rect class="bx-b" x="552" y="152" width="44" height="24" rx="5"/><text class="sm on-b" x="574" y="169" text-anchor="middle">5</text>
+  <text class="sm" x="620" y="169">range 到关闭</text>
+</svg>
+<figcaption>图 5-6　心跳把「时间上的猜测」变成了「事件上的同步」</figcaption>
+</figure>
+
+<p>
+  有了心跳，不用超时也能安全地写测试。唯一的风险是某次迭代耗时过长。如果这很重要，可以用更安全的<strong>按间隔心跳</strong>做到万无一失：
+</p>
+
+<div class="code" data-lang="go" data-file="heartbeats/interval_concurrent_test.go">
+<pre>
+func DoWork(
+	done &lt;-chan interface{},
+	pulseInterval time.Duration,
+	nums ...int,
+) (&lt;-chan interface{}, &lt;-chan int) {
+	heartbeat := make(chan interface{}, 1)
+	intStream := make(chan int)
+	go func() {
+		defer close(heartbeat)
+		defer close(intStream)
+
+		time.Sleep(2 * time.Second)
+
+		pulse := time.Tick(pulseInterval)
+	numLoop: // ② 用标签让内层循环能直接 continue 外层
+		for _, n := range nums {
+			for { // ① 两层循环：外层遍历数字，内层一直跑到这个数字成功发出为止
+				select {
+				case &lt;-done:
+					return
+				case &lt;-pulse:
+					select {
+					case heartbeat &lt;- struct{}{}:
+					default:
+					}
+				case intStream &lt;- n:
+					continue numLoop // ③ 发出成功，继续外层循环
+				}
+			}
+		}
+	}()
+	return heartbeat, intStream
+}
+
+func TestDoWork_GeneratesAllNumbers(t *testing.T) {
+	done := make(chan interface{})
+	defer close(done)
+
+	intSlice := []int{0, 1, 2, 3, 5}
+	const timeout = 2 * time.Second
+	heartbeat, results := DoWork(done, timeout/2, intSlice...)
+
+	&lt;-heartbeat // ④ 仍然先等第一次心跳，确认已进入循环
+
+	i := 0
+	for {
+		select {
+		case r, ok := &lt;-results:
+			if ok == false {
+				return
+			} else if expected := intSlice[i]; r != expected {
+				t.Errorf("index %v: expected %v, but received %v,", i, expected, r)
+			}
+			i++
+		case &lt;-heartbeat: // ⑤ 收到心跳就不超时
+		case &lt;-time.After(timeout):
+			t.Fatal("test timed out")
+		}
+	}
+}
+</pre>
+</div>
+
+<p>
+  这个版本的测试明显不那么清晰，测试逻辑有点混乱。所以如果你相当确定 goroutine 的循环一旦开始就不会停下，作者建议<strong>只阻塞在第一次心跳上，然后进入简单的 range</strong>。
+  可以另写专门的测试来检查「没关闭通道」「迭代太久」等时序问题。对于任何长时间运行的 goroutine、或需要测试的 goroutine，作者都强烈推荐心跳模式。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：用 <code>testing/synctest</code> 写确定性的并发测试 <span class="ver">Go 1.25+</span></div>
+  <p>
+    书中花了很大力气对付「测试里的时间不确定性」。Go 1.25 正式发布的 <code>testing/synctest</code> 从根本上解决了这个问题：
+    在 <code>synctest.Test</code> 的「气泡」里，<code>time</code> 包使用<strong>假时钟</strong>，只有当气泡里所有 goroutine 都阻塞时，时间才会跳到下一个定时事件。
+    于是 <code>time.Sleep(2*time.Second)</code>、超时、Ticker 都<strong>瞬间完成且完全确定</strong>。气泡结束时如果还有 goroutine 阻塞着，测试会失败，顺便帮你抓泄漏。
+  </p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="新写法：同一个测试，耗时 0.00s（本笔记已在 Go 1.27 下用 -race 验证）">
+<pre>
+func TestDoWork_GeneratesAllNumbers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		done := make(chan struct{})
+		defer close(done)
+
+		intSlice := []int{0, 1, 2, 3, 5}
+		heartbeat, results := DoWork(done, time.Second, intSlice...) // 内部的 2 秒启动延迟瞬间就「过去」了
+
+		i := 0
+		for {
+			select {
+			case r, ok := &lt;-results:
+				if !ok {
+					return
+				}
+				if r != intSlice[i] {
+					t.Errorf("index %v: expected %v, but received %v", i, intSlice[i], r)
+				}
+				i++
+			case &lt;-heartbeat:
+			case &lt;-time.After(10 * time.Second): // 假时钟下，这个超时是精确、确定的
+				t.Fatal("test timed out")
+			}
+		}
+	})
+}
+</pre>
+  </div>
+  <p>心跳在<strong>生产环境的健康监控</strong>里依然有价值；但对单元测试而言，<code>synctest</code> 通常是更简单的选择。还可以用 <code>synctest.Wait()</code> 等待气泡里其他 goroutine 都阻塞后再断言状态。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="replicated">复制请求（Replicated Requests）</h2>
+
+<p>
+  对某些应用来说，<strong>尽快拿到响应</strong>是第一要务：比如在处理用户的 HTTP 请求，或获取一块有多个副本的数据。这时可以做个取舍：
+  把请求复制给多个处理者（goroutine、进程或服务器），其中一个会比其他的快，立即返回它的结果。代价是要耗费资源维持多份处理者运行。
+  在内存里复制可能不贵，但如果要复制进程、服务器甚至数据中心，就很贵了。你要权衡成本是否值得。
+</p>
+
+<p>下面在单个进程里用 10 个 goroutine 作为处理者，每个随机睡 1–5 秒模拟负载（书中正文写的是「纳秒」，但代码里实际是秒）：</p>
+
+<div class="code" data-lang="go">
+<pre>
+doWork := func(
+	done &lt;-chan interface{},
+	id int,
+	wg *sync.WaitGroup,
+	result chan&lt;- int,
+) {
+	started := time.Now()
+	defer wg.Done()
+
+	// 模拟随机负载
+	simulatedLoadTime := time.Duration(1+rand.Intn(5)) * time.Second
+	select {
+	case &lt;-done:
+	case &lt;-time.After(simulatedLoadTime):
+	}
+
+	select {
+	case &lt;-done:
+	case result &lt;- id:
+	}
+
+	took := time.Since(started)
+	// 显示如果没被取消，每个处理者本来要花多久
+	if took &lt; simulatedLoadTime {
+		took = simulatedLoadTime
+	}
+	fmt.Printf("%v took %v\n", id, took)
+}
+
+done := make(chan interface{})
+result := make(chan int)
+
+var wg sync.WaitGroup
+wg.Add(10)
+
+for i := 0; i &lt; 10; i++ { // ① 启动 10 个处理者
+	go doWork(done, i, &amp;wg, result)
+}
+
+firstReturned := &lt;-result // ② 取第一个返回的结果
+close(done)               // ③ 取消其余的处理者，避免它们继续做无用功
+wg.Wait()
+
+fmt.Printf("Received an answer from #%v\n", firstReturned)
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+8 took 1.000211046s
+4 took 3s
+9 took 2s
+1 took 1.000568933s
+7 took 2s
+3 took 1.000590992s
+5 took 5s
+0 took 3s
+6 took 4s
+2 took 2s
+Received an answer from #8
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="复制请求：同一请求发给多个处理者，取最快的结果，取消其余">
+  <rect class="bx-a" x="20" y="96" width="120" height="56" rx="10"/>
+  <text class="ttl on-a" x="80" y="120" text-anchor="middle">请求</text><text class="sm" x="80" y="140" text-anchor="middle">复制 10 份</text>
+  <path class="ln" d="M142 124 L196 34 M142 124 L196 74 M142 124 L196 114 M142 124 L196 154 M142 124 L196 194 M142 124 L196 230"/>
+  <text class="mono" x="206" y="38">#0</text><rect class="bx" x="240" y="24" width="300" height="18" rx="4"/><rect class="bx-d" x="240" y="24" width="180" height="18" rx="4"/>
+  <text class="mono" x="206" y="78">#3</text><rect class="bx-g" x="240" y="64" width="60" height="18" rx="4"/>
+  <text class="mono" x="206" y="118">#5</text><rect class="bx-d" x="240" y="104" width="300" height="18" rx="4"/>
+  <text class="mono on-g" x="206" y="158">#8</text><rect class="bx-g" x="240" y="144" width="60" height="18" rx="4"/><text class="sm on-g" x="306" y="158">1.0s 第一个 ✓</text>
+  <text class="mono" x="206" y="198">#6</text><rect class="bx-d" x="240" y="184" width="240" height="18" rx="4"/>
+  <text class="mono" x="206" y="234">…</text>
+  <path class="ln-r" d="M300 14 V244" style="stroke-dasharray:5 4"/>
+  <text class="sm on-r" x="306" y="236">close(done)：其余全部取消</text>
+  <rect class="bx-g" x="580" y="120" width="160" height="56" rx="10"/>
+  <text class="ttl on-g" x="660" y="144" text-anchor="middle">返回 #8 的结果</text>
+  <text class="sm" x="660" y="164" text-anchor="middle">而不是等 #5 的 5 秒</text>
+  <path class="ln-g" d="M420 153 H576" marker-end="url(#ar-g)"/>
+  <text class="sm" x="560" y="40">虚线 = 本来要花的时间</text>
+</svg>
+<figcaption>图 5-7　复制请求：用资源换延迟</figcaption>
+</figure>
+
+<p>
+  这次 #8 最快。如果只启动了一个处理者、恰好是 #5，就要等 5 秒而不是 1 秒多。
+</p>
+
+<div class="box warn">
+  <div class="t">&#9888; 唯一的前提：处理者必须「各不相同」</div>
+  <p>
+    所有处理者都要有<strong>同等的机会</strong>处理请求 —— 一个处理不了请求的处理者，不可能给你最快的结果；处理者用到的资源也要一起复制。
+    同一个问题的另一面是<strong>一致性</strong>：处理者太相似，出现「快的离群者」的机会就小。只应把请求复制给运行条件不同的处理者：不同的进程、机器、访问数据存储的路径，或者干脆是不同的数据存储。
+    虽然搭建和维护很贵，但如果速度是目标，这是很有价值的技术，还顺带提供了容错和扩展性。
+  </p>
+</div>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：context 版本，以及「对冲请求」</div>
+  <div class="code" data-lang="go" data-tone="modern" data-file="新写法：用 context 取消落后者，用带缓冲通道防止泄漏">
+<pre>
+func first(ctx context.Context, replicas []string) (Result, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // 拿到第一个结果后，取消其余请求
+
+	// 缓冲大小 = 副本数：落后者即使没人读也能发出结果并退出，不会泄漏
+	results := make(chan Result, len(replicas))
+	for _, addr := range replicas {
+		go func() { results &lt;- query(ctx, addr) }()
+	}
+
+	select {
+	case r := &lt;-results:
+		return r, nil
+	case &lt;-ctx.Done():
+		return Result{}, ctx.Err()
+	}
+}
+</pre>
+  </div>
+  <p>
+    同时发 N 份很浪费。业界常用的折中叫<strong>对冲请求（hedged requests）</strong>，来自 Google 的论文 <em>The Tail at Scale</em>：
+    先发一份，如果在 P95 延迟内还没返回，再发第二份，取先到者。这样只多付出约 5% 的请求量，却能大幅削减长尾延迟。
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="ratelimit">限流（Rate Limiting）</h2>
+
+<p>
+  用过服务 API 的人多半都碰到过限流：把对某种资源的访问次数限制在每单位时间某个有限数量内。资源可以是任何东西：API 连接、磁盘读写、网络包、错误。
+</p>
+
+<p>为什么要限流？</p>
+<ul>
+  <li><strong>安全</strong>：防止一整类攻击。恶意用户如果能以他们资源允许的最快速度访问你的系统，就能做各种事：用日志或有效请求填满磁盘；如果日志轮转配置不当，甚至能做完坏事后再发足够多请求把痕迹挤出日志；暴力破解；DDoS……<strong>不限流，就很难保证系统安全。</strong></li>
+  <li><strong>公平</strong>：分布式系统里，一个合法用户如果请求量太大或代码有 bug，会降低其他用户的体验，甚至引发死亡螺旋。用户心中的模型是「我的访问是沙箱化的，既不影响别人、也不受别人影响」，打破它会让系统显得设计不良。</li>
+  <li><strong>稳定</strong>：即使只有一个用户，系统在非常规负载下也可能出现意料之外的行为，在分布式系统中级联放大：丢包 → 分布式数据库失去法定人数、停止写入 → 现有请求失败 → …… 系统对自己发动 DDoS 也不是没听说过。</li>
+  <li><strong>商业</strong>：可以让用户在严格限制下免费试用（Google 云就是这么做的）；付费用户写出失控的 bug 时，限流也能保护他们免于天价账单。用户自己也可以在客户端设一个很低的限额，防止搬起石头砸自己的脚。</li>
+</ul>
+
+<div class="box deep">
+  <div class="t">&#128270; 来自一线的故事</div>
+  <p>
+    作者曾参与一个分布式系统：通过启动新进程水平扩展，每个进程打开数据库连接、读数据、计算。起初扩展得很好，但后来系统负载上升，数据库读取开始超时。
+    DBA 翻遍日志，最后发现：系统里<strong>什么都没限流</strong>，进程们互相践踏，磁盘争用飙到 100% 并一直维持，形成了一种「虐待式」的轮流超时重试循环，任务永远完不成。
+    后来给数据库连接数和每个连接每秒读取的字节数加了限制，问题消失了。客户要等更久，但任务能完成，团队也能按部就班地做容量规划。
+  </p>
+</div>
+
+<p>
+  限流让你能推理系统的性能和稳定性：它防止系统跑出你已经研究过的边界。如果需要扩大边界，可以在大量测试和咖啡之后，有控制地扩大。
+</p>
+
+<h3 id="token-bucket">令牌桶算法</h3>
+
+<p>
+  大多数限流用的是<strong>令牌桶（token bucket）</strong>算法，容易理解，也相对容易实现：
+</p>
+<ul>
+  <li>要使用资源，必须有一个<strong>访问令牌</strong>，没有令牌请求就被拒绝（或排队等待）；</li>
+  <li>令牌放在一个桶里，桶的<strong>深度 d</strong> 表示最多能装多少个令牌；</li>
+  <li>每次访问资源，从桶里拿走一个令牌；</li>
+  <li>令牌以<strong>速率 r</strong> 补充回桶里（可以是每纳秒一个，也可以是每分钟一个）。这就是我们通常说的「速率限制」。</li>
+</ul>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="令牌桶：以速率 r 补充令牌，桶深度 d，每个请求取走一个令牌">
+  <!-- 水龙头 -->
+  <rect class="bx-c" x="230" y="14" width="120" height="34" rx="8"/>
+  <text class="sm on-c" x="290" y="36" text-anchor="middle">按速率 r 补充</text>
+  <path class="ln-c" d="M290 50 V78" marker-end="url(#ar-c)"/>
+  <circle class="dot-c" cx="290" cy="64" r="6" style="opacity:.5"/>
+  <!-- 桶 -->
+  <path class="ln" style="stroke-width:2.5" d="M200 84 L222 232 H358 L380 84"/>
+  <path class="ln-d" d="M196 84 H384"/>
+  <text class="sm" x="392" y="88">桶深度 d = 5（最多存 5 个）</text>
+  <circle class="dot-a" cx="250" cy="214" r="12"/><circle class="dot-a" cx="282" cy="214" r="12"/><circle class="dot-a" cx="314" cy="214" r="12"/>
+  <circle class="dot-a" cx="266" cy="186" r="12"/><circle class="dot-a" cx="298" cy="186" r="12"/>
+  <text class="lbl" x="290" y="256" text-anchor="middle">令牌</text>
+  <!-- 请求 -->
+  <path class="ln-a" d="M384 200 H470" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="426" y="192" text-anchor="middle">取走 1 个</text>
+  <rect class="bx-g" x="474" y="176" width="140" height="48" rx="10"/>
+  <text class="ttl on-g" x="544" y="198" text-anchor="middle">请求被放行</text><text class="sm" x="544" y="216" text-anchor="middle">有令牌</text>
+  <rect class="bx-r" x="474" y="110" width="270" height="48" rx="10"/>
+  <text class="ttl on-r" x="609" y="132" text-anchor="middle">桶空了：排队等待，或直接拒绝</text>
+  <text class="sm" x="609" y="150" text-anchor="middle">rate.Limiter.Wait 是「等」，Allow 是「拒」</text>
+  <text class="sm" x="40" y="130">d 决定「突发」：</text>
+  <text class="sm" x="40" y="148">桶满时能连发多少个</text>
+  <text class="sm" x="40" y="180">r 决定「长期速率」</text>
+</svg>
+<figcaption>图 5-8　令牌桶：d 控制突发，r 控制平均速率</figcaption>
+</figure>
+
+<p>书中用几张时间表演示了 d 和 r 的效果（假设请求瞬间完成）：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="令牌桶时间线：深度 5、速率每秒 0.5 个时，先突发 5 个，之后每 2 秒一个">
+  <text class="ttl" x="20" y="24">d = 5，r = 0.5 个/秒：先突发 5 个，然后每 2 秒 1 个</text>
+  <path class="ln" d="M60 100 H730" marker-end="url(#ar)"/>
+  <text class="sm" x="60" y="122" text-anchor="middle">0s</text><text class="sm" x="160" y="122" text-anchor="middle">1s</text>
+  <text class="sm" x="260" y="122" text-anchor="middle">2s</text><text class="sm" x="360" y="122" text-anchor="middle">3s</text>
+  <text class="sm" x="460" y="122" text-anchor="middle">4s</text><text class="sm" x="560" y="122" text-anchor="middle">5s</text>
+  <text class="sm" x="660" y="122" text-anchor="middle">6s</text>
+  <!-- burst at 0 -->
+  <rect class="bx-g" x="50" y="40" width="20" height="16" rx="3"/><rect class="bx-g" x="50" y="58" width="20" height="16" rx="3"/>
+  <rect class="bx-g" x="50" y="76" width="20" height="16" rx="3"/><rect class="bx-g" x="72" y="76" width="20" height="16" rx="3"/>
+  <rect class="bx-g" x="72" y="58" width="20" height="16" rx="3"/>
+  <text class="sm on-g" x="100" y="56">5 个 tok</text>
+  <rect class="bx-g" x="250" y="76" width="20" height="16" rx="3"/>
+  <rect class="bx-g" x="450" y="76" width="20" height="16" rx="3"/>
+  <rect class="bx-g" x="650" y="76" width="20" height="16" rx="3"/>
+  <text class="sm" x="160" y="92" text-anchor="middle">桶 0 (0.5)</text>
+  <text class="sm" x="360" y="92" text-anchor="middle">桶 0 (0.5)</text>
+  <text class="sm" x="560" y="92" text-anchor="middle">桶 0 (0.5)</text>
+  <text class="sm" x="380" y="152" text-anchor="middle">■ 成功的请求（拿到令牌）</text>
+  <text class="lbl" x="380" y="180" text-anchor="middle">同理：d = 1，r = 1 个/秒时，立即能发 1 个，之后每秒 1 个；d = 5 时也不必一次用完，</text>
+  <text class="lbl" x="380" y="200" text-anchor="middle">比如先突发 2 个，4 秒后桶又攒满，可以再突发 5 个</text>
+</svg>
+<figcaption>图 5-9　突发（burstiness）与长期速率</figcaption>
+</figure>
+
+<p>
+  突发对「偶尔访问、但访问时希望尽快往返」的用户很友好。你只需要保证系统能承受所有用户同时突发，或者统计上足够多用户同时突发的可能性很低。无论哪种，限流都让你承担的是<strong>经过计算的风险</strong>。
+</p>
+
+<h3 id="rate-go">在 Go 里实现</h3>
+
+<p>假设有一个 API 客户端，提供读文件和解析域名两个接口（省略了真实参数）：</p>
+
+<div class="code" data-lang="go" data-file="rate-limiting/fig-no-rate-limit.go（节选）">
+<pre>
+func Open() *APIConnection {
+	return &amp;APIConnection{}
+}
+
+type APIConnection struct{}
+
+func (a *APIConnection) ReadFile(ctx context.Context) error {
+	// 假装这里在干活
+	return nil
+}
+
+func (a *APIConnection) ResolveAddress(ctx context.Context) error {
+	// 假装这里在干活
+	return nil
+}
+
+func main() {
+	defer log.Printf("Done.")
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.Ltime | log.LUTC)
+
+	apiConnection := Open()
+	var wg sync.WaitGroup
+	wg.Add(20)
+
+	for i := 0; i &lt; 10; i++ {
+		go func() {
+			defer wg.Done()
+			err := apiConnection.ReadFile(context.Background())
+			if err != nil {
+				log.Printf("cannot ReadFile: %v", err)
+			}
+			log.Printf("ReadFile")
+		}()
+	}
+
+	for i := 0; i &lt; 10; i++ {
+		go func() {
+			defer wg.Done()
+			err := apiConnection.ResolveAddress(context.Background())
+			if err != nil {
+				log.Printf("cannot ResolveAddress: %v", err)
+			}
+			log.Printf("ResolveAddress")
+		}()
+	}
+
+	wg.Wait()
+}
+// 所有 20 个请求几乎同时完成（都是 20:13:13）
+</pre>
+</div>
+
+<p>
+  没有限流，客户端想多快访问就多快访问。（提醒一下：如果驱动程序里有个 bug 导致死循环，没有限流的话，你可能会收到一张吓人的账单。）
+  加限流器：作者在 <code>APIConnection</code> 里加（通常限流器在服务端，用户没法绕过；客户端限流器只是避免无谓请求的优化）。
+  用的是 <code>golang.org/x/time/rate</code> 包的令牌桶实现，它是最接近标准库的选择：
+</p>
+
+<div class="code" data-lang="go" data-file="golang.org/x/time/rate 的核心 API">
+<pre>
+// Limit 定义某类事件的最大频率，表示为每秒事件数。0 表示不允许任何事件。
+type Limit float64
+
+// NewLimiter 返回一个允许速率 r、最多突发 b 个令牌的限流器。
+func NewLimiter(r Limit, b int) *Limiter
+
+// Every 把「事件之间的最小间隔」转换成 Limit。
+func Every(interval time.Duration) Limit
+
+// Wait 是 WaitN(ctx, 1) 的简写。
+func (lim *Limiter) Wait(ctx context.Context) error
+
+// WaitN 阻塞直到允许 n 个事件发生。如果 n 超过突发上限、ctx 被取消、
+// 或预计等待时间超过 ctx 的截止时间，返回错误。
+func (lim *Limiter) WaitN(ctx context.Context, n int) (err error)
+</pre>
+</div>
+
+<p>作者更喜欢用「每段时间多少次」来表达速率，于是基于 <code>Every</code> 写了个辅助函数（<code>Every</code> 在间隔为 0 时会返回 <code>rate.Inf</code>，即不限）：</p>
+
+<div class="code" data-lang="go">
+<pre>
+func Per(eventCount int, duration time.Duration) rate.Limit {
+	return rate.Every(duration / time.Duration(eventCount))
+}
+</pre>
+</div>
+
+<div class="code" data-lang="go" data-file="rate-limiting/fig-simple-rate-limit.go（节选）">
+<pre>
+func Open() *APIConnection {
+	return &amp;APIConnection{
+		rateLimiter: rate.NewLimiter(rate.Limit(1), 1), // ① 所有 API 调用合计每秒 1 次
+	}
+}
+
+type APIConnection struct {
+	rateLimiter *rate.Limiter
+}
+
+func (a *APIConnection) ReadFile(ctx context.Context) error {
+	if err := a.rateLimiter.Wait(ctx); err != nil { // ② 等到拿到令牌才继续
+		return err
+	}
+	// 假装这里在干活
+	return nil
+}
+
+func (a *APIConnection) ResolveAddress(ctx context.Context) error {
+	if err := a.rateLimiter.Wait(ctx); err != nil {
+		return err
+	}
+	// 假装这里在干活
+	return nil
+}
+// 输出：22:08:30、22:08:31、22:08:32…… 每秒完成一个
+</pre>
+</div>
+
+<h3 id="multi-limiter">多级限流</h3>
+
+<p>
+  生产环境往往需要<strong>多层</strong>限制：细粒度的每秒限制，加上粗粒度的每分钟、每小时、每天限制。有时一个限流器就能做到，但并非总能做到；而且把「每单位时间的限制」揉进一层，会丢失很多关于意图的信息。
+  作者更喜欢把限流器分开，再组合成一个统一管理的限流器：
+</p>
+
+<div class="code" data-lang="go" data-file="rate-limiting/fig-multi-rate-limit.go（节选）">
+<pre>
+type RateLimiter interface { // ① 定义接口，让 MultiLimiter 可以递归地包含其他 MultiLimiter
+	Wait(context.Context) error
+	Limit() rate.Limit
+}
+
+func MultiLimiter(limiters ...RateLimiter) *multiLimiter {
+	byLimit := func(i, j int) bool {
+		return limiters[i].Limit() &lt; limiters[j].Limit()
+	}
+	sort.Slice(limiters, byLimit) // ② 优化：按限制从严到松排序
+	return &amp;multiLimiter{limiters: limiters}
+}
+
+type multiLimiter struct {
+	limiters []RateLimiter
+}
+
+func (l *multiLimiter) Wait(ctx context.Context) error {
+	for _, l := range l.limiters {
+		if err := l.Wait(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (l *multiLimiter) Limit() rate.Limit {
+	return l.limiters[0].Limit() // ③ 因为排过序，第一个就是最严格的
+}
+</pre>
+</div>
+
+<p>
+  <code>Wait</code> 依次等待每个子限流器。这些调用可能阻塞也可能不阻塞，但必须通知每个限流器以便扣减令牌。依次等待的结果是<strong>恰好等待最长的那段时间</strong>：
+  前面短的等待在阻塞时，后面的桶也在补充令牌，所以轮到最长的那个时，只需等剩余的时间，之后的等待会立即返回。
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+func Open() *APIConnection {
+	secondLimit := rate.NewLimiter(Per(2, time.Second), 1)   // ① 每秒 2 次，没有突发
+	minuteLimit := rate.NewLimiter(Per(10, time.Minute), 10) // ② 每分钟 10 次，突发 10 个作为初始额度
+	return &amp;APIConnection{
+		rateLimiter: MultiLimiter(secondLimit, minuteLimit), // ③ 组合成总限流器
+	}
+}
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+22:46:10 ResolveAddress
+22:46:10 ReadFile
+22:46:11 ReadFile
+22:46:11 ReadFile
+22:46:12 ReadFile
+22:46:12 ReadFile
+22:46:13 ReadFile
+22:46:13 ReadFile
+22:46:14 ReadFile
+22:46:14 ReadFile
+22:46:16 ResolveAddress     ← 第 11 个：只隔 2 秒（滑动窗口里已经攒了一个新令牌）
+22:46:22 ResolveAddress     ← 之后受每分钟 10 次限制，每 6 秒一个
+22:46:28 ReadFile
+...
+22:47:10 Done.
+</pre>
+</div>
+
+<p>
+  前 10 个请求每秒 2 个，之后每 6 秒一个 —— 每分钟的令牌池用完了，开始受它限制。第 11 个请求只等了 2 秒而不是 6 秒，是因为「一分钟」是一个<strong>滑动窗口</strong>，到第 11 个时每分钟限流器已经又积累了一个令牌。
+</p>
+
+<p>这种做法还能让我们跨越时间之外的<strong>维度</strong>来思考：除了 API 调用次数，往往还要限制磁盘访问、网络访问等资源：</p>
+
+<div class="code" data-lang="go" data-file="rate-limiting/fig-tiered-rate-limit.go（节选）">
+<pre>
+func Open() *APIConnection {
+	return &amp;APIConnection{
+		apiLimit: MultiLimiter( // ① API 调用：每秒和每分钟都有限制
+			rate.NewLimiter(Per(2, time.Second), 2),
+			rate.NewLimiter(Per(10, time.Minute), 10),
+		),
+		diskLimit: MultiLimiter( // ② 磁盘：每秒 1 次
+			rate.NewLimiter(rate.Limit(1), 1),
+		),
+		networkLimit: MultiLimiter( // ③ 网络：每秒 3 次
+			rate.NewLimiter(Per(3, time.Second), 3),
+		),
+	}
+}
+
+type APIConnection struct {
+	networkLimit,
+	diskLimit,
+	apiLimit RateLimiter
+}
+
+func (a *APIConnection) ReadFile(ctx context.Context) error {
+	err := MultiLimiter(a.apiLimit, a.diskLimit).Wait(ctx) // ④ 读文件：API 限制 + 磁盘限制
+	if err != nil {
+		return err
+	}
+	// 假装这里在干活
+	return nil
+}
+
+func (a *APIConnection) ResolveAddress(ctx context.Context) error {
+	err := MultiLimiter(a.apiLimit, a.networkLimit).Wait(ctx) // ⑤ 解析域名：API 限制 + 网络限制
+	if err != nil {
+		return err
+	}
+	// 假装这里在干活
+	return nil
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="多维度限流器组合：读文件受 API 和磁盘限流，解析地址受 API 和网络限流">
+  <rect class="bx-a" x="290" y="20" width="180" height="70" rx="12"/>
+  <text class="ttl on-a" x="380" y="44" text-anchor="middle">apiLimit</text>
+  <text class="sm" x="380" y="64" text-anchor="middle">2 次/秒 + 10 次/分钟</text>
+  <text class="sm" x="380" y="80" text-anchor="middle">（本身也是 MultiLimiter）</text>
+  <rect class="bx-b" x="40" y="20" width="180" height="70" rx="12"/>
+  <text class="ttl on-b" x="130" y="48" text-anchor="middle">diskLimit</text><text class="sm" x="130" y="70" text-anchor="middle">1 次/秒</text>
+  <rect class="bx-p" x="540" y="20" width="180" height="70" rx="12"/>
+  <text class="ttl on-p" x="630" y="48" text-anchor="middle">networkLimit</text><text class="sm" x="630" y="70" text-anchor="middle">3 次/秒</text>
+  <rect class="bx-g" x="120" y="150" width="200" height="56" rx="12"/>
+  <text class="mono on-g" x="220" y="174" text-anchor="middle">ReadFile</text><text class="sm" x="220" y="194" text-anchor="middle">MultiLimiter(api, disk)</text>
+  <rect class="bx-g" x="440" y="150" width="200" height="56" rx="12"/>
+  <text class="mono on-g" x="540" y="174" text-anchor="middle">ResolveAddress</text><text class="sm" x="540" y="194" text-anchor="middle">MultiLimiter(api, network)</text>
+  <path class="ln-b" d="M140 92 L200 146" marker-end="url(#ar-b)"/>
+  <path class="ln-a" d="M340 92 L250 146" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M420 92 L510 146" marker-end="url(#ar-a)"/>
+  <path class="ln-p" d="M620 92 L570 146" marker-end="url(#ar-p)"/>
+</svg>
+<figcaption>图 5-10　按资源维度组合限流器：每个调用只等它真正用到的资源</figcaption>
+</figure>
+
+<p>
+  不必为每个调用画时间表 —— 关键是我们能把逻辑上的限流器组合成对每个调用都合理的分组，<code>APIClient</code> 会做正确的事。
+  <code>rate.Limiter</code> 还有其他技巧（优化与其他用例），这里只用了「等待直到拿到下一个令牌」这一种。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：限流的现代补充</div>
+  <ul>
+    <li><code>golang.org/x/time/rate</code> 依然是 Go 生态最常用的令牌桶实现。除 <code>Wait</code> 外，<code>Allow()</code> 用于「拿不到就立刻拒绝」（比如 HTTP 中间件返回 429），<code>Reserve()</code> 可以先预订再决定，<code>SetLimit/SetBurst</code> 可以运行时调整。</li>
+    <li><span class="ver">Go 1.21+</span> <code>sort.Slice(limiters, byLimit)</code> 可以写成类型安全的 <code>slices.SortFunc(limiters, func(a, b RateLimiter) int { return cmp.Compare(a.Limit(), b.Limit()) })</code>。</li>
+    <li>书中的 <code>multiLimiter.Wait</code> 有个细节：如果前一个限流器已经扣了令牌、后一个因 ctx 取消而失败，前面扣掉的令牌不会退还。对精确计费的场景，需要用 <code>Reserve</code> 再 <code>Cancel</code> 来实现。</li>
+    <li>多实例部署时，进程内限流只能限制单个实例；全局限流通常放在网关或借助 Redis 等共享存储实现。</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="healing">自愈的 goroutine</h2>
+
+<p>
+  在守护进程这种长期运行的程序里，常常有一组长期存活的 goroutine。它们通常阻塞着，等数据以某种方式到来，然后醒来干活、再把数据传下去。
+  有时 goroutine 依赖的资源你控制不好：也许要从某个 Web 服务拉数据，或在监控一个临时文件。goroutine 很容易陷入一种没有外力帮助就无法恢复的坏状态。
+  如果按关注点分离，「干活的 goroutine 知道怎样从坏状态治愈自己」本就不该是它的职责。
+  在长期运行的进程里，建立一种机制来确保 goroutine 保持健康、不健康时重启它，会很有用。我们把重启 goroutine 的过程称为<strong>治愈（healing）</strong>。
+</p>
+
+<p>
+  治愈要用心跳来检查被监控 goroutine 的活性。心跳的类型取决于你要监控什么：如果 goroutine 可能活锁，心跳里要包含能证明「它不仅活着、还在做有用的事」的信息。
+  简单起见，这里只考虑活着还是死了。我们把监控健康的逻辑叫<strong>管家（steward）</strong>，被监控的 goroutine 叫<strong>被监护者（ward）</strong>。
+  管家还负责在被监护者不健康时重启它，所以需要一个能启动它的函数：
+</p>
+
+<div class="box deep">
+  <div class="t">&#128270; 熟悉 Erlang 的读者</div>
+  <p>会认出这个概念：Erlang 的 supervisor（监督者）做的就是类似的事。</p>
+</div>
+
+<div class="code" data-lang="go" data-file="healing-unhealthy-goroutines/fig-example-steward-usage.go（节选）">
+<pre>
+type startGoroutineFn func(
+	done &lt;-chan interface{},
+	pulseInterval time.Duration,
+) (heartbeat &lt;-chan interface{}) // ① 可被监控、可被重启的 goroutine 的签名：熟悉的 done、心跳间隔、心跳通道
+
+newSteward := func(
+	timeout time.Duration,
+	startGoroutine startGoroutineFn,
+) startGoroutineFn { // ② 管家接收被监护者的超时时间和启动函数；有趣的是，它自己也返回 startGoroutineFn —— 管家本身也可以被监控
+	return func(
+		done &lt;-chan interface{},
+		pulseInterval time.Duration,
+	) &lt;-chan interface{} {
+		heartbeat := make(chan interface{})
+		go func() {
+			defer close(heartbeat)
+
+			var wardDone chan interface{}
+			var wardHeartbeat &lt;-chan interface{}
+			startWard := func() { // ③ 封装「以一致的方式启动被监护者」
+				wardDone = make(chan interface{})                             // ④ 每次启动都新建一个 done，以便需要时单独叫停这个被监护者
+				wardHeartbeat = startGoroutine(or(wardDone, done), timeout/2) // ⑤ 管家被停止，或管家想停止被监护者，被监护者都要停 → 用 or 组合两个 done
+			}
+			startWard()
+			pulse := time.Tick(pulseInterval)
+
+		monitorLoop:
+			for {
+				timeoutSignal := time.After(timeout)
+
+				for { // ⑥ 内层循环：保证管家自己也能发出心跳
+					select {
+					case &lt;-pulse:
+						select {
+						case heartbeat &lt;- struct{}{}:
+						default:
+						}
+					case &lt;-wardHeartbeat: // ⑦ 收到被监护者的心跳，重新开始一轮监控（重置超时）
+						continue monitorLoop
+					case &lt;-timeoutSignal: // ⑧ 超时没收到心跳：叫停被监护者，启动一个新的
+						log.Println("steward: ward unhealthy; restarting")
+						close(wardDone)
+						startWard()
+						continue monitorLoop
+					case &lt;-done:
+						return
+					}
+				}
+			}
+		}()
+
+		return heartbeat
+	}
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="管家监控被监护者的心跳，超时后关闭旧的并启动新的">
+  <rect class="bx-a" x="20" y="70" width="220" height="130" rx="14"/>
+  <text class="ttl on-a" x="130" y="96" text-anchor="middle">steward（管家）</text>
+  <text class="sm" x="130" y="120" text-anchor="middle">每轮开一个 timeout 计时</text>
+  <text class="sm" x="130" y="140" text-anchor="middle">收到心跳 → 重置计时</text>
+  <text class="sm" x="130" y="160" text-anchor="middle">超时 → close(wardDone)</text>
+  <text class="sm" x="130" y="180" text-anchor="middle">→ startWard() 重启</text>
+  <rect class="bx-r" x="480" y="20" width="260" height="70" rx="12" style="opacity:.75"/>
+  <text class="ttl on-r" x="610" y="46" text-anchor="middle">ward #1（不健康）</text>
+  <text class="sm" x="610" y="68" text-anchor="middle">心跳停了 → 被 wardDone 叫停</text>
+  <rect class="bx-g" x="480" y="160" width="260" height="70" rx="12"/>
+  <text class="ttl on-g" x="610" y="186" text-anchor="middle">ward #2（新启动）</text>
+  <text class="sm" x="610" y="208" text-anchor="middle">done = or(wardDone, done)</text>
+  <path class="ln-r" style="stroke-dasharray:5 4" d="M476 66 C 380 66, 320 100, 244 110" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="360" y="60" text-anchor="middle">……沉默……</text>
+  <path class="ln-a" d="M242 130 C 330 130, 380 70, 476 50" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="380" y="104" text-anchor="middle">close(wardDone)</text>
+  <path class="ln-a" d="M242 170 C 330 170, 380 190, 476 190" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="360" y="160" text-anchor="middle">startWard()</text>
+  <path class="ln-g flow" d="M476 214 C 380 240, 300 230, 244 190" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="360" y="252" text-anchor="middle">心跳</text>
+  <path class="ln-c" d="M130 68 V30 H200" marker-end="url(#ar-c)"/>
+  <text class="sm on-c" x="206" y="34">管家自己也发心跳 → 可以被更上层的管家监控</text>
+</svg>
+<figcaption>图 5-11　steward / ward：用心跳判断健康，用 done 叫停，用启动函数重启</figcaption>
+</figure>
+
+<p>试一下监控一个行为不端的 goroutine：</p>
+
+<div class="code" data-lang="go">
+<pre>
+log.SetOutput(os.Stdout)
+log.SetFlags(log.Ltime | log.LUTC)
+
+doWork := func(done &lt;-chan interface{}, _ time.Duration) &lt;-chan interface{} {
+	log.Println("ward: Hello, I'm irresponsible!")
+	go func() {
+		&lt;-done // ① 除了等着被取消什么都不做，也不发心跳
+		log.Println("ward: I am halting.")
+	}()
+	return nil
+}
+doWorkWithSteward := newSteward(4*time.Second, doWork) // ② 给 doWork 配一个管家，超时 4 秒
+
+done := make(chan interface{})
+time.AfterFunc(9*time.Second, func() { // ③ 9 秒后叫停管家和被监护者，让例子结束
+	log.Println("main: halting steward and ward.")
+	close(done)
+})
+
+for range doWorkWithSteward(done, 4*time.Second) { // ④ 启动管家，range 它的心跳防止程序退出
+}
+log.Println("Done")
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+18:28:07 ward: Hello, I'm irresponsible!
+18:28:11 steward: ward unhealthy; restarting
+18:28:11 ward: Hello, I'm irresponsible!
+18:28:11 ward: I am halting.
+18:28:15 steward: ward unhealthy; restarting
+18:28:15 ward: Hello, I'm irresponsible!
+18:28:15 ward: I am halting.
+18:28:16 main: halting steward and ward.
+18:28:16 ward: I am halting.
+18:28:16 Done
+</pre>
+</div>
+
+<p>
+  效果不错！但这个被监护者太简单了：除了取消和心跳需要的东西，它不接受参数也不返回值。怎样让任意形状的被监护者都能配合管家？
+  每次都重写或生成管家既麻烦又没必要，用<strong>闭包</strong>就行。下面是一个根据一组离散值生成整数流的被监护者：
+</p>
+
+<div class="code" data-lang="go" data-file="healing-unhealthy-goroutines/fig-more-complicated-ward.go（节选）">
+<pre>
+doWorkFn := func(
+	done &lt;-chan interface{},
+	intList ...int,
+) (startGoroutineFn, &lt;-chan interface{}) { // ① 接收被监护者要闭包引用的值，返回被监护者用来回传数据的通道
+	intChanStream := make(chan (&lt;-chan interface{})) // ② 「通道的通道」，bridge 模式的一部分
+	intStream := bridge(done, intChanStream)
+	doWork := func(
+		done &lt;-chan interface{},
+		pulseInterval time.Duration,
+	) &lt;-chan interface{} { // ③ 这个闭包会被管家启动和监控
+		intStream := make(chan interface{}) // ④ 这一次启动所用的新通道
+		heartbeat := make(chan interface{})
+		go func() {
+			defer close(intStream)
+			select {
+			case intChanStream &lt;- intStream: // ⑤ 告诉 bridge：之后从这个新通道读
+			case &lt;-done:
+				return
+			}
+
+			pulse := time.Tick(pulseInterval)
+
+			for {
+			valueLoop:
+				for _, intVal := range intList {
+					if intVal &lt; 0 {
+						log.Printf("negative value: %v\n", intVal) // ⑥ 模拟不健康：遇到负数就记错误并退出
+						return
+					}
+
+					for {
+						select {
+						case &lt;-pulse:
+							select {
+							case heartbeat &lt;- struct{}{}:
+							default:
+							}
+						case intStream &lt;- intVal:
+							continue valueLoop
+						case &lt;-done:
+							return
+						}
+					}
+				}
+			}
+		}()
+		return heartbeat
+	}
+	return doWork, intStream
+}
+</pre>
+</div>
+
+<p>因为可能启动多个被监护者实例，这里用了第 4 章的 <strong>bridge</strong>，为 <code>doWork</code> 的消费者呈现一个不间断的通道。组合模式就能让被监护者任意复杂：</p>
+
+<div class="code" data-lang="go">
+<pre>
+log.SetFlags(log.Ltime | log.LUTC)
+log.SetOutput(os.Stdout)
+
+done := make(chan interface{})
+defer close(done)
+
+doWork, intStream := doWorkFn(done, 1, 2, -1, 3, 4, 5) // ① 创建被监护者函数，闭包引用这组整数
+doWorkWithSteward := newSteward(1*time.Millisecond, doWork) // ② 预计很快就会失败，监控周期设为 1 毫秒
+doWorkWithSteward(done, 1*time.Hour) // ③ 启动管家，开始监控
+
+for intVal := range take(done, intStream, 6) { // ④ 用第 4 章的 take 取前 6 个值
+	fmt.Printf("Received: %v\n", intVal)
+}
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+Received: 1
+23:25:33 negative value: -1
+Received: 2
+23:25:33 steward: ward unhealthy; restarting
+Received: 1
+23:25:33 negative value: -1
+Received: 2
+23:25:33 steward: ward unhealthy; restarting
+Received: 1
+23:25:33 negative value: -1
+Received: 2
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="每次重启都创建新通道，bridge 把它们拼成一个连续的流">
+  <rect class="bx-r" x="20" y="20" width="200" height="40" rx="10"/><text class="sm on-r" x="120" y="45" text-anchor="middle">ward 第 1 次：1, 2, (-1 退出)</text>
+  <rect class="bx-r" x="20" y="76" width="200" height="40" rx="10"/><text class="sm on-r" x="120" y="101" text-anchor="middle">ward 第 2 次：1, 2, (-1 退出)</text>
+  <rect class="bx-r" x="20" y="132" width="200" height="40" rx="10"/><text class="sm on-r" x="120" y="157" text-anchor="middle">ward 第 3 次：1, 2, …</text>
+  <path class="ln-c" d="M222 40 C 280 40, 290 96, 336 96"/>
+  <path class="ln-c" d="M222 96 H336"/>
+  <path class="ln-c" d="M222 152 C 280 152, 290 96, 336 96"/>
+  <rect class="bx-a" x="340" y="70" width="140" height="52" rx="12"/>
+  <text class="ttl on-a" x="410" y="94" text-anchor="middle">bridge</text><text class="sm" x="410" y="112" text-anchor="middle">逐个通道读</text>
+  <path class="ln-g flow" d="M482 96 H560" marker-end="url(#ar-g)"/>
+  <rect class="bx-g" x="564" y="70" width="176" height="52" rx="12"/>
+  <text class="ttl on-g" x="652" y="92" text-anchor="middle">消费者看到</text><text class="mono" x="652" y="112" text-anchor="middle">1 2 1 2 1 2</text>
+  <text class="lbl" x="380" y="192" text-anchor="middle">每次重启都从头开始 → 重复值；如果系统对重复敏感，要在被监护者里保存进度</text>
+</svg>
+<figcaption>图 5-12　自愈 + bridge：消费者看到的是一个不间断的流</figcaption>
+</figure>
+
+<p>
+  收到的值里夹杂着被监护者的错误，以及管家检测到问题并重启它的日志。注意我们只收到了 1 和 2：这是被监护者每次<strong>从头开始</strong>的症状。
+  开发被监护者时，如果系统对重复值敏感，一定要考虑这一点；也可以考虑写一个失败若干次后就放弃的管家。这个例子里，可以让生成器变成有状态的，每次迭代都更新闭包引用的 <code>intList</code>：
+</p>
+
+<div class="vs">
+  <div class="old"><div class="h">原来：每次重启从头遍历</div>
+<div class="code" data-lang="go"><pre>
+valueLoop:
+for _, intVal := range intList {
+	// ...
+}
+</pre></div></div>
+  <div class="new"><div class="h">改为：消费一个就从列表里移除</div>
+<div class="code" data-lang="go"><pre>
+valueLoop:
+for {
+	intVal := intList[0]
+	intList = intList[1:]
+	// ...
+}
+</pre></div></div>
+</div>
+
+<p>
+  这样重启之间就能保存进度，不过我们会一直卡在那个无效的负数上，被监护者会不停失败。用这个模式，能帮助你的长期 goroutine 保持健康运行。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：今天的「监督」怎么做</div>
+  <ul>
+    <li>用 <code>context.Context</code> 代替 done 通道和 or：<code>wardCtx, cancelWard := context.WithCancel(ctx)</code>，父 ctx 取消时被监护者自动取消，管家想重启时调用 <code>cancelWard()</code>。</li>
+    <li>社区有成熟的 Erlang 风格监督树库，如 <code>github.com/thejerf/suture</code>，处理了退避重启、失败阈值、日志等细节。</li>
+    <li>在容器编排时代，很多「自愈」交给了进程级别：Kubernetes 的 liveness 探针就是「心跳 + 重启」的进程版。进程内的监督仍然适合重启单个子任务、而不想整个进程重启的场景。</li>
+    <li>如果被监护者可能 panic，管家里还要用 <code>recover</code> 捕获，否则一个 goroutine 的 panic 会让整个进程崩溃。</li>
+  </ul>
+</div>
+
+<h2 id="summary">本章小结</h2>
+
+<div class="tw">
+<table>
+  <tr><th>主题</th><th>核心做法</th></tr>
+  <tr><td>错误传播</td><td>错误要包含「发生了什么、何时何地、友好消息、日志 ID」；在模块边界包装；未包装的原始错误 = bug</td></tr>
+  <tr><td>超时与取消</td><td>为饱和、过期数据、防死锁而超时；让长计算分段可抢占；共享状态尽量最后一次性修改</td></tr>
+  <tr><td>心跳</td><td>按间隔的心跳监控健康；按工作单元的心跳写确定性测试（今天还可以用 synctest）</td></tr>
+  <tr><td>复制请求</td><td>同一请求发给多个「不同条件」的处理者，取最快的，取消其余</td></tr>
+  <tr><td>限流</td><td>令牌桶：d 控制突发、r 控制速率；按时间和资源维度组合多个限流器</td></tr>
+  <tr><td>自愈</td><td>steward 用心跳 + 超时监控 ward，不健康就叫停并重启；用 bridge 给消费者一个不间断的流</td></tr>
+</table>
+</div>
+
+<div class="exercise">
+  <h3>&#9998; 动手练习</h3>
+  <ol>
+    <li>把本章错误传播的例子改成 Go 1.13+ 的写法：给 <code>MyError</code> 加 <code>Unwrap</code>，用 <code>errors.As</code> 判断，再用 <code>fmt.Errorf("%w")</code> 在中间多包一层，确认判断仍然正确。</li>
+    <li>用 <code>testing/synctest</code> 为「按间隔心跳」的 <code>doWork</code> 写一个测试，断言在 10 秒（假时钟）内收到了约 10 次心跳和 5 个结果。</li>
+    <li>写一个 HTTP 中间件：每个客户端 IP 一个 <code>rate.Limiter</code>（每秒 5 次、突发 10），超出时返回 429。思考：限流器存在 map 里会不会无限增长？</li>
+    <li>给 steward 加上「连续失败 3 次就放弃并返回错误」的功能。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

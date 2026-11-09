@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>附录 A · 工具箱 — Go 并发编程图解笔记</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="7">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">附录 A</span>
+<h1>工具箱：读 panic、找竞态、做剖析</h1>
+<p class="lede">
+  写并发代码，离不开分析正确性的工具，也需要一些帮助你理解程序内部发生了什么的手段。Go 生态在这方面非常丰富。
+  原书附录介绍了三件事：goroutine panic 时的输出怎么读、竞态检测器、以及 pprof。本笔记在后半部分补充了书出版后出现的新工具。
+</p>
+
+<div class="goals">
+  <h4>本附录内容</h4>
+  <ul>
+    <li>读懂 goroutine panic 的栈跟踪</li>
+    <li>用 <code>-race</code> 找出数据竞争，并把它放进 CI</li>
+    <li>用 <code>runtime/pprof</code> 观察 goroutine 数量、阻塞与锁争用</li>
+    <li>新工具：goroutine 泄漏分析、<code>go vet</code> 的并发检查、<code>testing/synctest</code>、执行追踪与飞行记录器</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<!-- ============================================================ -->
+<h2 id="panic">读懂 goroutine 的 panic</h2>
+
+<p>
+  迟早有一天你的程序会 panic。运气好的话，没有人或机器受到伤害，最糟也就是盯着一份栈跟踪发呆。
+  在 Go 1.6 之前，goroutine panic 时运行时会打印<strong>所有</strong>正在运行的 goroutine 的栈，有时很难（至少很费时间）找出发生了什么。
+  Go 1.6 起只打印<strong>发生 panic 的那个 goroutine</strong> 的栈，简单多了。
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+package main
+
+func main() {
+	waitForever := make(chan interface{})
+	go func() {
+		panic("test panic") // 第 6 行
+	}() // 第 7 行
+	&lt;-waitForever
+}
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="书中（Go 1.8）的输出">
+<pre>
+panic: test panic
+
+goroutine 4 [running]:
+main.main.func1()
+	/tmp/babel-3271QbD/go-src-32713Rn.go:6 +0x65
+created by main.main
+	/tmp/babel-3271QbD/go-src-32713Rn.go:7 +0x4e
+exit status 2
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="goroutine panic 栈跟踪各部分的含义">
+  <rect class="bx" x="20" y="20" width="420" height="190" rx="10"/>
+  <text class="mono" x="36" y="46">panic: test panic</text>
+  <text class="mono" x="36" y="76">goroutine 4 [running]:</text>
+  <text class="mono on-a" x="36" y="100">main.main.func1()</text>
+  <text class="mono on-b" x="52" y="122">main.go:6 +0x65</text>
+  <text class="mono on-g" x="36" y="150">created by main.main</text>
+  <text class="mono on-g" x="52" y="172">main.go:7 +0x4e</text>
+  <text class="mono" x="36" y="198">exit status 2</text>
+
+  <path class="ln-a" d="M190 96 H470"/><text class="sm on-a" x="476" y="92">③ 作为 goroutine 运行的函数名</text>
+  <text class="sm" x="476" y="108">　 匿名函数会被自动分配唯一名字，如 func1</text>
+  <path class="ln-b" d="M200 118 H470"/><text class="sm on-b" x="476" y="128">① panic 发生的位置</text>
+  <path class="ln-g" d="M210 162 H470"/><text class="sm on-g" x="476" y="162">② 这个 goroutine 是在哪里被启动的</text>
+  <text class="sm" x="476" y="196">「goroutine 4 [running]」：编号与状态</text>
+</svg>
+<figcaption>图 A-1　panic 栈跟踪的三个关键信息</figcaption>
+</figure>
+
+<p>
+  如果想看 panic 时所有正在执行的 goroutine 的栈，可以把环境变量 <code>GOTRACEBACK</code> 设为 <code>all</code>，恢复旧行为（还有 <code>system</code>、<code>crash</code> 等级别，会显示更多运行时内部信息）。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：栈跟踪里能看到「父 goroutine」了 <span class="ver">Go 1.21+</span></div>
+  <p>同样的程序在 Go 1.27 上输出：</p>
+  <div class="code" data-lang="text" data-tone="modern" data-file="Go 1.27 的输出">
+<pre>
+panic: test panic
+
+goroutine 18 [running]:
+main.main.func1()
+	/.../panic/main.go:6 +0x25
+created by main.main in goroutine 1
+	/.../panic/main.go:5 +0x2d
+</pre>
+  </div>
+  <p>
+    「created by ... <strong>in goroutine 1</strong>」告诉你是哪个 goroutine 启动了它，排查「谁创建了这些泄漏的 goroutine」时非常有用。
+    另外 <span class="ver">Go 1.26</span> 加入、<span class="ver">Go 1.27</span> 默认开启的 <code>tracebacklabels</code>，会把通过 <code>pprof.Do</code> 设置的 goroutine 标签显示在栈跟踪的头部，
+    例如标上请求 ID，就能知道崩溃的 goroutine 在处理哪个请求。
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="race">竞态检测（Race Detection）</h2>
+
+<p>Go 1.1 给大多数 go 命令加入了 <code>-race</code> 标志：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+$ go test -race mypkg    # 测试这个包
+$ go run -race mysrc.go  # 编译并运行程序
+$ go build -race mycmd   # 构建命令
+$ go install -race mypkg # 安装包
+</pre>
+</div>
+
+<p>
+  如果你只需要一种更可靠的检测竞态条件的方法，知道这些就够了。一个需要注意的地方是：<strong>它只能发现「实际被执行到」的代码里的竞态</strong>。
+  所以 Go 团队建议在真实负载下运行用 <code>-race</code> 构建的程序 —— 执行到的代码越多，发现竞态的概率越大。
+</p>
+
+<p>第 1 章那个简单的程序：</p>
+
+<div class="code" data-lang="go">
+<pre>
+var data int
+go func() {
+	data++
+}()
+if data == 0 {
+	fmt.Printf("the value is %v.\n", data)
+}
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="go run -race 的输出（Go 1.27）">
+<pre>
+==================
+WARNING: DATA RACE
+Write at 0x00c000096028 by goroutine 8:
+  main.main.func1()
+      /.../race/main.go:8 +0x44
+
+Previous read at 0x00c000096028 by main goroutine:
+  main.main()
+      /.../race/main.go:10 +0xae
+
+Goroutine 8 (running) created at:
+  main.main()
+      /.../race/main.go:7 +0xa4
+==================
+Found 1 data race(s)
+exit status 66
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 180" role="img" aria-label="竞态报告的结构：写方、读方、goroutine 创建位置">
+  <rect class="bx-r" x="20" y="20" width="230" height="110" rx="12"/>
+  <text class="ttl on-r" x="135" y="46" text-anchor="middle">Write … by goroutine 8</text>
+  <text class="sm" x="135" y="70" text-anchor="middle">某个 goroutine 在做</text>
+  <text class="sm" x="135" y="88" text-anchor="middle">未同步的内存写入</text>
+  <text class="mono" x="135" y="112" text-anchor="middle">data++（第 8 行）</text>
+  <rect class="bx-b" x="265" y="20" width="230" height="110" rx="12"/>
+  <text class="ttl on-b" x="380" y="46" text-anchor="middle">Previous read … by main</text>
+  <text class="sm" x="380" y="70" text-anchor="middle">另一个 goroutine（这里是主 goroutine）</text>
+  <text class="sm" x="380" y="88" text-anchor="middle">在读同一块内存</text>
+  <text class="mono" x="380" y="112" text-anchor="middle">if data == 0（第 10 行）</text>
+  <rect class="bx-g" x="510" y="20" width="230" height="110" rx="12"/>
+  <text class="ttl on-g" x="625" y="46" text-anchor="middle">Goroutine 8 created at</text>
+  <text class="sm" x="625" y="70" text-anchor="middle">写方 goroutine 是在哪里</text>
+  <text class="sm" x="625" y="88" text-anchor="middle">被启动的</text>
+  <text class="mono" x="625" y="112" text-anchor="middle">go func()（第 7 行）</text>
+  <text class="lbl" x="380" y="162" text-anchor="middle">地址相同（0x00c000096028）→ 两个访问碰到了同一个变量；其中至少一个是写，且没有同步</text>
+</svg>
+<figcaption>图 A-2　竞态报告：谁写、谁读、写方是从哪里来的</figcaption>
+</figure>
+
+<p>
+  竞态检测器还有一些可以通过环境变量调整的选项，不过默认值通常就够了。注意它们都写在 <strong><code>GORACE</code></strong> 环境变量里，如 <code>GORACE="log_path=/tmp/race strip_path_prefix=/my/src/"</code>：
+</p>
+
+<dl class="terms">
+  <dt>log_path</dt><dd>把报告写到 <code>log_path.pid</code> 文件。也可以用特殊值 <code>stdout</code>、<code>stderr</code>，默认是 <code>stderr</code>。</dd>
+  <dt>strip_path_prefix</dt><dd>去掉报告里文件路径的前缀，让报告更简洁。</dd>
+  <dt>history_size</dt><dd>每个 goroutine 记住多少次之前的内存访问，取值 0–7。内存从 32KB（0）开始每级翻倍，最大 4MB（7）。报告里看到「failed to restore the stack」时就该调大它，但会显著增加内存消耗。</dd>
+  <dt>halt_on_error</dt><dd>发现第一个竞态就退出（书中未提及，调试时很有用）。</dd>
+</dl>
+
+<div class="box key">
+  <div class="t">&#9733; 把竞态检测放进持续集成</div>
+  <p>
+    作者强烈建议把它集成进 CI。再强调一次：它只能检测<em>实际发生</em>的竞态，而竞态有时很难触发，所以应该持续地运行真实场景来尝试触发。
+    代价是程序会慢很多（通常内存增加 5–10 倍、执行时间增加 2–20 倍），所以一般不在生产环境长期开启。
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="pprof">pprof</h2>
+
+<p>
+  在大型代码库里，很难弄清程序运行时的表现：有多少 goroutine 在跑？CPU 用满了吗？内存怎么样？性能剖析（profiling）是回答这些问题的好办法。
+  Go 标准库里支持一个叫 <strong>pprof</strong> 的剖析器（源自 Google），它既能在程序运行时显示剖析数据，也能读取保存下来的运行时统计。
+  它的命令行用法 <code>go tool pprof -h</code> 说得很清楚，这里只讨论和并发相关的 <code>runtime/pprof</code> 包。它预定义了这些剖析：
+</p>
+
+<div class="tw">
+<table>
+  <tr><th>剖析名</th><th>内容</th><th>并发相关的用途</th></tr>
+  <tr><td><code>goroutine</code></td><td>当前所有 goroutine 的栈</td><td>发现 goroutine 泄漏、看大家都卡在哪</td></tr>
+  <tr><td><code>heap</code></td><td>堆上存活对象的分配采样</td><td>内存为何增长</td></tr>
+  <tr><td><code>allocs</code></td><td>所有历史分配的采样</td><td>（书出版后加入）找分配热点</td></tr>
+  <tr><td><code>threadcreate</code></td><td>导致创建新 OS 线程的栈</td><td>为什么线程数这么多（常见于阻塞的系统调用、cgo）</td></tr>
+  <tr><td><code>block</code></td><td>在同步原语上阻塞的栈</td><td>谁在等通道、等锁、等 select（需先 <code>runtime.SetBlockProfileRate</code>）</td></tr>
+  <tr><td><code>mutex</code></td><td>争用激烈的互斥锁的持有者</td><td>锁竞争（需先 <code>runtime.SetMutexProfileFraction</code>）</td></tr>
+  <tr><td><code>goroutineleak</code></td><td>已泄漏的 goroutine 的栈</td><td><span class="ver">Go 1.26 实验 / 1.27</span> 见下一节</td></tr>
+</table>
+</div>
+
+<p>比如，下面这个 goroutine 每秒记录一次当前 goroutine 的数量，可以帮你发现泄漏：</p>
+
+<div class="code" data-lang="go">
+<pre>
+log.SetFlags(log.Ltime | log.LUTC)
+log.SetOutput(os.Stdout)
+
+// 每秒记录一次当前运行的 goroutine 数量
+go func() {
+	goroutines := pprof.Lookup("goroutine")
+	for range time.Tick(1 * time.Second) {
+		log.Printf("goroutine count: %d\n", goroutines.Count())
+	}
+}()
+
+// 创建一些永远不会退出的 goroutine
+var blockForever chan struct{}
+for i := 0; i &lt; 10; i++ {
+	go func() { &lt;-blockForever }()
+	time.Sleep(500 * time.Millisecond)
+}
+</pre>
+</div>
+
+<p>内置剖析已经很有用，你还可以写自定义的剖析来监控程序：</p>
+
+<div class="code" data-lang="go">
+<pre>
+func newProfIfNotDef(name string) *pprof.Profile {
+	prof := pprof.Lookup(name)
+	if prof == nil {
+		prof = pprof.NewProfile(name)
+	}
+	return prof
+}
+
+prof := newProfIfNotDef("my_package_namespace")
+// prof.Add(resource, 1) 记录「谁持有了这个资源」，prof.Remove(resource) 在释放时移除
+// 适合追踪必须显式关闭的资源，如文件、连接
+</pre>
+</div>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：更方便的 pprof 用法</div>
+  <ul>
+    <li>服务程序里加一行 <code>import _ "net/http/pprof"</code>，就能通过 <code>/debug/pprof/</code> 下载实时剖析，例如：<code>go tool pprof -http=:8080 http://localhost:6060/debug/pprof/goroutine</code>，在浏览器里看火焰图。</li>
+    <li>测试时：<code>go test -cpuprofile cpu.out -memprofile mem.out -blockprofile block.out -mutexprofile mutex.out</code>。</li>
+    <li><code>runtime.NumGoroutine()</code> 是最简单的 goroutine 计数；<code>runtime/metrics</code>（Go 1.16+）提供了稳定的运行时指标接口，如 <code>/sched/goroutines:goroutines</code>、<code>/sync/mutex/wait/total:seconds</code>，适合接入监控系统。</li>
+    <li><code>pprof.Do(ctx, pprof.Labels("request", id), f)</code> 可以给 goroutine 打标签，在 CPU 和 goroutine 剖析里按标签过滤。</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="leak">新工具：goroutine 泄漏剖析 <span class="ver">Go 1.26 实验 / 1.27</span></h2>
+
+<p>
+  第 4 章说过「goroutine 不会被垃圾回收」。新版运行时在这一点上前进了一步：垃圾回收器本来就知道哪些对象「不可达」，
+  如果一个 goroutine 阻塞在一个<strong>除了它自己以外再也没人能访问到</strong>的通道或锁上，那它就永远不可能被唤醒 —— 这就是泄漏。
+  <code>goroutineleak</code> 剖析会触发一次带泄漏检测的 GC，只报告这类 goroutine。它在 Go 1.26 以实验形式出现（需要 <code>GOEXPERIMENT=goroutineleakprofile</code>），在 Go 1.27 中默认可用。
+</p>
+
+<div class="code" data-lang="go" data-tone="modern" data-file="leak.go（在 Go 1.27 下验证）">
+<pre>
+func main() {
+	for i := 0; i &lt; 3; i++ {
+		ch := make(chan int)
+		go func() { &lt;-ch }() // 泄漏：除了这个 goroutine，没人再引用 ch
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	pprof.Lookup("goroutineleak").WriteTo(os.Stdout, 1)
+}
+</pre>
+</div>
+
+<div class="code" data-lang="text" data-file="输出">
+<pre>
+goroutineleak profile: total 3
+3 @ 0x47d82a 0x41512e 0x414c72 0x4deaf9 0x483561
+#	0x4deaf8	main.main.func1+0x18	/.../leak.go:13
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="泄漏检测原理：阻塞在不可达通道上的 goroutine 永远无法被唤醒">
+  <text class="ttl on-g" x="185" y="26" text-anchor="middle">正常阻塞：还有人能唤醒它</text>
+  <text class="ttl on-r" x="575" y="26" text-anchor="middle">泄漏：没人能再碰到这个通道</text>
+  <path class="ln-d" d="M380 14 V190"/>
+  <circle class="dot-b" cx="80" cy="100" r="18"/><text class="sm" x="80" y="104" text-anchor="middle" style="fill:#fff">G</text>
+  <rect class="bx-c" x="150" y="80" width="80" height="40" rx="20"/><text class="mono on-c" x="190" y="105" text-anchor="middle">ch</text>
+  <path class="ln" d="M100 100 H146" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="270" y="80" width="90" height="40" rx="8"/><text class="sm on-a" x="315" y="105" text-anchor="middle">main 持有 ch</text>
+  <path class="ln-a" d="M268 100 H234" marker-end="url(#ar-a)"/>
+  <text class="sm" x="190" y="160" text-anchor="middle">将来可能有人发送 → 不算泄漏</text>
+
+  <circle class="dot-b" cx="470" cy="100" r="18"/><text class="sm" x="470" y="104" text-anchor="middle" style="fill:#fff">G</text>
+  <rect class="bx-r" x="540" y="80" width="80" height="40" rx="20"/><text class="mono on-r" x="580" y="105" text-anchor="middle">ch</text>
+  <path class="ln" d="M490 100 H536" marker-end="url(#ar)"/>
+  <text class="sm on-r" x="680" y="96" text-anchor="middle">没有任何</text>
+  <text class="sm on-r" x="680" y="112" text-anchor="middle">其他引用</text>
+  <text class="sm" x="575" y="160" text-anchor="middle">GC 能证明它永远醒不来 → 报告为泄漏</text>
+</svg>
+<figcaption>图 A-3　goroutineleak 利用 GC 的可达性分析发现「永远醒不来」的 goroutine</figcaption>
+</figure>
+
+<p>
+  注意它只能发现「阻塞在不可达同步原语上」的泄漏。如果泄漏的 goroutine 阻塞在一个全局变量引用的通道上，或者在死循环里空转，它就无能为力。测试里还可以用：
+</p>
+<ul>
+  <li><code>go.uber.org/goleak</code>：<code>defer goleak.VerifyNone(t)</code> 或在 <code>TestMain</code> 里 <code>goleak.VerifyTestMain(m)</code>，测试结束时如果还有多余的 goroutine 就失败；</li>
+  <li><code>testing/synctest</code>（见下文）：气泡结束时若仍有阻塞的 goroutine，测试失败。</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="vet">新工具：go vet 的并发检查</h2>
+
+<p><code>go vet</code>（<code>go test</code> 会自动运行其中一部分）里有不少和并发相关的检查，很多坑在编译前就能被发现：</p>
+
+<div class="tw">
+<table>
+  <tr><th>检查</th><th>发现什么问题</th><th>相关章节</th></tr>
+  <tr><td><code>copylocks</code></td><td>按值复制了包含 <code>sync.Mutex</code>、<code>WaitGroup</code> 等的结构体（复制后的锁是另一把锁）</td><td>第 3 章</td></tr>
+  <tr><td><code>lostcancel</code></td><td><code>context.WithCancel/WithTimeout</code> 返回的 <code>cancel</code> 没有被调用</td><td>第 4 章</td></tr>
+  <tr><td><code>loopclosure</code></td><td>（Go 1.22 之前的模块）goroutine 闭包引用了循环变量</td><td>第 3 章</td></tr>
+  <tr><td><code>waitgroup</code> <span class="ver">Go 1.25+</span></td><td>在新 goroutine 内部调用 <code>wg.Add</code></td><td>第 3 章</td></tr>
+  <tr><td><code>atomic</code></td><td><code>x = atomic.AddInt64(&amp;x, 1)</code> 这类误用</td><td>第 1 章</td></tr>
+  <tr><td><code>testinggoroutine</code></td><td>在测试启动的 goroutine 里调用 <code>t.Fatal</code>（只会退出那个 goroutine，不会终止测试）</td><td>第 5 章</td></tr>
+</table>
+</div>
+
+<p>第三方的 <code>staticcheck</code> 还会检查用内建类型做 context 键（SA1029）、空的临界区、<code>time.Tick</code> 误用等更多问题。</p>
+
+<!-- ============================================================ -->
+<h2 id="synctest">新工具：testing/synctest <span class="ver">Go 1.25+</span></h2>
+
+<p>
+  第 5 章花了很多篇幅对付「并发测试里时间不确定」的问题。<code>testing/synctest</code> 给出了标准答案：在一个隔离的「气泡（bubble）」里运行测试，
+  气泡里的 goroutine 使用<strong>假时钟</strong>（从 2000-01-01 00:00 UTC 开始），只有当气泡里所有 goroutine 都「持久阻塞」时，时间才会前进到下一个定时事件。
+</p>
+
+<div class="code" data-lang="go" data-tone="modern">
+<pre>
+func TestTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		time.Sleep(4 * time.Second) // 瞬间完成
+		synctest.Wait()             // 等气泡里其他 goroutine 都阻塞下来
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("还没到 5 秒就超时了: %v", err)
+		}
+
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if ctx.Err() != context.DeadlineExceeded {
+			t.Fatal("5 秒后应该超时")
+		}
+	})
+}
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#10003; synctest 的几条使用建议</div>
+  <ul>
+    <li>测试要自包含：不要和气泡外启动的 goroutine 交互，避免真实网络（用 <code>net.Pipe</code> 等内存实现），避免外部进程。</li>
+    <li>「持久阻塞」指阻塞在气泡内的通道、<code>select</code>、<code>sync.WaitGroup</code>、<code>sync.Cond</code>、<code>time.Sleep</code> 等上；阻塞在系统调用或气泡外的锁上不算。</li>
+    <li>它让「超时」「心跳」「限流」「重试退避」这些和时间有关的逻辑都能被快速、确定地测试。</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="trace">新工具：执行追踪与飞行记录器</h2>
+
+<p>
+  pprof 告诉你「在哪里花了时间」，<strong>执行追踪（execution trace）</strong>告诉你「什么时候发生了什么」：每个 P 上 goroutine 什么时候运行、为什么阻塞、被谁唤醒、GC 何时发生。它特别适合排查延迟毛刺和并发度不足。
+</p>
+
+<div class="code" data-lang="bash">
+<pre>
+$ go test -trace=trace.out ./...          # 测试时采集
+$ go tool trace trace.out                 # 在浏览器里查看时间线
+$ curl -o trace.out 'http://localhost:6060/debug/pprof/trace?seconds=5'  # 从运行中的服务采集
+</pre>
+</div>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：低开销追踪与飞行记录器 <span class="ver">Go 1.22+</span><span class="ver">Go 1.25+</span></div>
+  <p>
+    Go 1.22 重写了追踪器，开销从 10–20% 降到 1–2% 左右，长时间开启也可以接受。Go 1.25 加入了 <code>runtime/trace.FlightRecorder</code>：
+    在内存里循环保存最近几秒的追踪数据，平时几乎不占资源，等程序检测到异常（比如某个请求特别慢）时，再把「事故发生前的那几秒」写到文件里 —— 就像飞机的黑匣子。
+  </p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="飞行记录器示意">
+<pre>
+fr := trace.NewFlightRecorder(trace.FlightRecorderConfig{
+	MinAge:   5 * time.Second, // 至少保留最近 5 秒
+	MaxBytes: 16 &lt;&lt; 20,
+})
+fr.Start()
+defer fr.Stop()
+
+// ……某个请求处理得特别慢时：
+if elapsed &gt; 300*time.Millisecond {
+	f, _ := os.Create("slow.trace")
+	fr.WriteTo(f) // 导出事故前后的执行轨迹
+	f.Close()
+}
+</pre>
+  </div>
+  <p>还可以用 <code>GODEBUG=schedtrace=1000,scheddetail=1</code> 每秒打印调度器状态（第 6 章）。</p>
+</div>
+
+<h2 id="cheatsheet">速查：遇到问题该用哪个工具</h2>
+
+<div class="tw">
+<table>
+  <tr><th>症状</th><th>先用</th><th>再用</th></tr>
+  <tr><td>结果偶尔不对</td><td><code>go test -race</code></td><td>竞态报告 + 第 1、3 章</td></tr>
+  <tr><td>程序卡住不动</td><td><code>SIGQUIT</code>（Ctrl+\）或 <code>/debug/pprof/goroutine?debug=2</code> 看所有 goroutine 的栈</td><td><code>goroutineleak</code> 剖析</td></tr>
+  <tr><td>内存 / goroutine 数持续上涨</td><td><code>runtime.NumGoroutine()</code> 趋势、<code>goroutine</code> 剖析</td><td><code>goleak</code>、<code>goroutineleak</code></td></tr>
+  <tr><td>CPU 没用满、吞吐上不去</td><td><code>block</code> / <code>mutex</code> 剖析</td><td><code>go tool trace</code> 看并发度</td></tr>
+  <tr><td>偶发的延迟毛刺</td><td>飞行记录器</td><td><code>go tool trace</code></td></tr>
+  <tr><td>时间相关的测试不稳定</td><td><code>testing/synctest</code></td><td>心跳（第 5 章）</td></tr>
+</table>
+</div>
+
+<div id="pager"></div>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

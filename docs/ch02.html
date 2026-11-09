@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 2 章 · 用 CSP 为代码建模 — Go 并发编程图解笔记</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="2">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 2 章</span>
+<h1>用 CSP 为代码建模</h1>
+<p class="lede">
+  这一章讲的是 Go 的「设计动机」。理解了它，你就能明白 Go 社区里那些口号 ——
+  「不要通过共享内存来通信，而要通过通信来共享内存」—— 到底在说什么，
+  以及什么时候该用通道、什么时候该老老实实用锁。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>彻底分清「并发」和「并行」：一个是代码的属性，一个是运行的属性</li>
+    <li>理解「上下文」决定正确性，以及为什么越往底层并发越难</li>
+    <li>知道 CSP（通信顺序进程）是什么，它和 Go 的通道、select 有什么关系</li>
+    <li>掌握「用锁还是用通道」的决策树</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="cvp">并发和并行的区别</h2>
+
+<p>
+  很多人把这两个词混着用，意思都是「同时运行的东西」。区分它们不是咬文嚼字 ——
+  这个区分是一个非常强大的建模抽象，而 Go 充分利用了它。先记住这句话：
+</p>
+
+<div class="box key">
+  <div class="t">&#9733; 并发是代码的属性；并行是运行中程序的属性。</div>
+  <p>Concurrency is a property of the code; parallelism is a property of the running program.</p>
+</div>
+
+<p>
+  假设我写了一段代码，希望其中两块「并行」运行。如果把程序放到只有一个核的机器上呢？
+  它们<em>看起来</em>在并行，其实是 CPU 在不同任务之间快速切换（上下文切换），在足够粗的时间粒度上看，就像同时在跑。
+  同一个二进制放到双核机器上，它们才<em>可能</em>真正并行。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="单核上的并发交替执行与双核上的并行执行">
+  <text class="ttl" x="20" y="28">同一段并发代码，在两台机器上：</text>
+  <text class="lbl" x="20" y="72">单核</text>
+  <text class="sm" x="20" y="88">（并发，不并行）</text>
+  <rect class="bx-b" x="140" y="56" width="70" height="32" rx="5"/><text class="sm on-b" x="175" y="77" text-anchor="middle">任务 A</text>
+  <rect class="bx-p" x="212" y="56" width="70" height="32" rx="5"/><text class="sm on-p" x="247" y="77" text-anchor="middle">任务 B</text>
+  <rect class="bx-b" x="284" y="56" width="70" height="32" rx="5"/><text class="sm on-b" x="319" y="77" text-anchor="middle">任务 A</text>
+  <rect class="bx-p" x="356" y="56" width="70" height="32" rx="5"/><text class="sm on-p" x="391" y="77" text-anchor="middle">任务 B</text>
+  <rect class="bx-b" x="428" y="56" width="70" height="32" rx="5"/><text class="sm on-b" x="463" y="77" text-anchor="middle">任务 A</text>
+  <rect class="bx-p" x="500" y="56" width="70" height="32" rx="5"/><text class="sm on-p" x="535" y="77" text-anchor="middle">任务 B</text>
+  <text class="sm" x="590" y="70">CPU 来回切换</text>
+  <text class="sm" x="590" y="86">完成时间 ≈ 6 格</text>
+
+  <text class="lbl" x="20" y="150">双核</text>
+  <text class="sm" x="20" y="166">（并发，且并行）</text>
+  <text class="sm" x="118" y="140" text-anchor="end">核 1</text>
+  <text class="sm" x="118" y="180" text-anchor="end">核 2</text>
+  <rect class="bx-b" x="140" y="124" width="214" height="32" rx="5"/><text class="sm on-b" x="247" y="145" text-anchor="middle">任务 A</text>
+  <rect class="bx-p" x="140" y="164" width="214" height="32" rx="5"/><text class="sm on-p" x="247" y="185" text-anchor="middle">任务 B</text>
+  <text class="sm" x="372" y="150">真正同时执行</text>
+  <text class="sm" x="372" y="166">完成时间 ≈ 3 格</text>
+  <path class="ln" d="M140 222 H570" marker-end="url(#ar)"/>
+  <text class="sm" x="580" y="226">时间</text>
+</svg>
+<figcaption>图 2-1　我们写的是并发代码，至于它是否并行执行，取决于运行它的环境</figcaption>
+</figure>
+
+<p>这揭示了三件有趣的事：</p>
+<ol>
+  <li><strong>我们从不写「并行代码」，只写「希望能被并行执行的并发代码」。</strong>并行是运行时的属性。</li>
+  <li><strong>我们可以（甚至应该）不关心并发代码是否真的在并行。</strong>这要归功于程序下面的一层层抽象：并发原语、运行时、操作系统、虚拟机/容器、CPU。</li>
+  <li><strong>并行与否取决于「上下文」（时间窗口或边界）。</strong>如果上下文是 5 秒，两个各跑 1 秒的操作可以算并行；如果上下文是 1 秒，它们就是顺序的。</li>
+</ol>
+
+<p>
+  第一章讲原子性时，「上下文」是判断一个操作是否原子的边界；这里它是判断两个操作是否并行的边界。
+  上下文不只能是时间，也可以是<strong>进程、操作系统线程、或者机器</strong>。而你选择的上下文，和「并发代码是否正确」密切相关。
+</p>
+
+<h3 id="context">上下文越往下，越难推理</h3>
+
+<p>
+  举个例子：你我各自在自己电脑上打开计算器做加法，我的计算不会影响你的。这里机器是上下文，进程是并发操作。
+  我们用「独立的计算机、操作系统、进程」来建模，所以能很自信地断言正确性。
+</p>
+
+<p>
+  往下走一层：同一台机器上的两个进程呢？进程 A 可能覆盖进程 B 正在读的文件；在不安全的系统上，甚至可能破坏 B 的内存（很多漏洞就是这么来的）。
+  不过在进程层面，操作系统还能帮我们保持逻辑隔离。
+</p>
+
+<p>
+  再往下到<strong>操作系统线程</strong>这一层，第 1 章的所有问题都来了：竞态、死锁、活锁、饥饿。如果所有用户共享同一个计算器进程，要写对就难多了。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="并发上下文从机器到进程到线程逐层下降，正确性越来越难推理">
+  <rect class="bx-g" x="20"  y="20"  width="460" height="250" rx="16"/>
+  <text class="ttl on-g" x="36" y="44">机器</text>
+  <rect class="bx-b" x="50"  y="58"  width="400" height="196" rx="14"/>
+  <text class="ttl on-b" x="66" y="82">进程</text>
+  <rect class="bx-y" x="80"  y="96"  width="340" height="142" rx="12"/>
+  <text class="ttl on-y" x="96" y="120">操作系统线程</text>
+  <rect class="bx-c" x="110" y="134" width="280" height="88" rx="10"/>
+  <text class="ttl on-c" x="126" y="158">goroutine + channel</text>
+  <text class="sm" x="126" y="180">Go 不是在线程上「又加一层」，</text>
+  <text class="sm" x="126" y="198">而是「取代」了线程作为建模单位</text>
+
+  <path class="ln-r" d="M530 40 V250" marker-end="url(#ar-r)"/>
+  <text class="lbl" x="546" y="50">隔离靠机器边界，容易推理</text>
+  <text class="lbl" x="546" y="104">进程间：文件、内存可能互相干扰</text>
+  <text class="lbl" x="546" y="148">线程间：竞态、死锁、活锁、饥饿</text>
+  <text class="lbl on-r" x="546" y="246">越往下越难，越需要好用的原语</text>
+</svg>
+<figcaption>图 2-2　抽象层越低，并发越难推理，可组合的并发原语就越重要</figcaption>
+</figure>
+
+<p>
+  越往抽象栈下面走，并发建模越难推理，也越重要；反过来，我们的抽象也越重要。
+  不幸的是，业界大多数并发逻辑都写在了最高的一层：<strong>操作系统线程</strong>。
+  在 Go 出现之前，主流语言的抽象链到线程就结束了：想写并发，就用线程建模，再同步线程之间对内存的访问；线程太多，就建线程池，把操作复用到池子上。
+</p>
+
+<p>
+  Go 在这条链上加了一环：<strong>goroutine</strong>，还从 Tony Hoare 那里借来了<strong>通道（channel）</strong>。
+  按理说再往下加一层抽象会更难，但事实恰恰相反 —— 因为 Go 并没有在线程<em>之上</em>再叠一层，而是<strong>取代</strong>了线程。
+  线程当然还在，但我们很少需要按线程来思考问题，而是用 goroutine 和通道来建模，偶尔使用共享内存。
+</p>
+
+<h2 id="csp">CSP 是什么？</h2>
+
+<p>
+  谈到 Go 你经常会听到 CSP 这个缩写，有时它被吹成 Go 成功的原因、并发编程的灵丹妙药。CSP 确实让事情变简单、程序更健壮，但它不是奇迹。
+</p>
+
+<p>
+  CSP 是 <strong>Communicating Sequential Processes（通信顺序进程）</strong> 的缩写，既是一种技术，也是 1978 年 Tony Hoare
+  （Charles Antony Richard Hoare）在 ACM 上发表的论文名。当时大家的精力都花在顺序程序的结构上：<code>goto</code> 该不该用、面向对象刚开始流行。
+  Hoare 认为，<strong>输入和输出是被忽视的两个编程原语，尤其是在并发代码里</strong>。
+</p>
+
+<p>
+  在 Hoare 的 CSP 语言里，「进程」指任何一段需要输入才能运行、并产生输出供其他进程消费的封装逻辑（如果不是当时编程界正在争论程序结构，他大概会直接叫它「函数」）。
+  进程之间用两个命令通信：<code>!</code> 表示<strong>发送</strong>，<code>?</code> 表示<strong>接收</strong>。
+</p>
+
+<div class="tw">
+<table>
+  <tr><th>CSP 写法</th><th>含义</th><th>今天的 Go 大致对应</th></tr>
+  <tr><td><code>cardreader?cardimage</code></td><td>从 cardreader 读一张卡片，赋给变量 cardimage</td><td><code>cardimage := &lt;-cardreader</code></td></tr>
+  <tr><td><code>lineprinter!lineimage</code></td><td>把 lineimage 发给 lineprinter 打印</td><td><code>lineprinter &lt;- lineimage</code></td></tr>
+  <tr><td><code>X?(x, y)</code></td><td>从名为 X 的进程读一对值，赋给 x 和 y</td><td><code>p := &lt;-X; x, y := p.x, p.y</code></td></tr>
+  <tr><td><code>DIV!(3*a+b, 13)</code></td><td>向进程 DIV 输出两个值</td><td><code>DIV &lt;- pair{3*a+b, 13}</code></td></tr>
+  <tr><td><code>*[c:character; west?c → east!c]</code></td><td>把 west 输出的字符逐个转发给 east；west 结束时循环结束</td><td><code>for c := range west { east &lt;- c }</code></td></tr>
+</table>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 170" role="img" aria-label="CSP 中 west 和 east 两个进程通过中间变量对应起来，类似 Go 的管道">
+  <rect class="bx-b" x="40" y="50" width="150" height="60" rx="10"/>
+  <text class="ttl on-b" x="115" y="76" text-anchor="middle">west</text>
+  <text class="sm" x="115" y="96" text-anchor="middle">产生字符</text>
+  <path class="ln-a flow" d="M192 80 H300" marker-end="url(#ar-a)"/>
+  <text class="mono on-a" x="246" y="70" text-anchor="middle">west?c</text>
+  <rect class="bx-a" x="304" y="50" width="150" height="60" rx="10"/>
+  <text class="ttl on-a" x="379" y="76" text-anchor="middle">复制进程</text>
+  <text class="sm" x="379" y="96" text-anchor="middle">变量 c</text>
+  <path class="ln-a flow" d="M456 80 H564" marker-end="url(#ar-a)"/>
+  <text class="mono on-a" x="510" y="70" text-anchor="middle">east!c</text>
+  <rect class="bx-g" x="568" y="50" width="150" height="60" rx="10"/>
+  <text class="ttl on-g" x="643" y="76" text-anchor="middle">east</text>
+  <text class="sm" x="643" y="96" text-anchor="middle">消费字符</text>
+  <text class="lbl" x="380" y="148" text-anchor="middle">一个进程的输出直接流入另一个进程的输入 —— 这就是「对应」（correspond），也是第 4 章「管道」的雏形</text>
+</svg>
+<figcaption>图 2-3　CSP 的核心：进程之间靠输入/输出通信</figcaption>
+</figure>
+
+<p>
+  和 Go 通道的相似之处一目了然。Hoare 最初的论文里，进程只能通过<em>具名</em>的源和目标通信，他也承认这会让代码难以做成库（调用者得知道输入输出的名字），
+  并顺带提到可以注册「端口名」—— 我们今天大概会称之为具名参数和具名返回值。
+</p>
+
+<p>
+  CSP 还使用了 Dijkstra 在 1974 年提出的<strong>守卫命令（guarded command）</strong>：用 <code>→</code> 分隔的左右两部分，
+  左边是条件（守卫），只有守卫为真时右边才会执行。把守卫命令和 I/O 命令结合起来，就是 Hoare 的通信进程 —— 也是 Go 通道和 <code>select</code> 的基础。
+</p>
+
+<p>
+  历史证明 Hoare 是对的。但有意思的是，Go 之前很少有主流语言真正把这些原语放进语言里，大多数语言更偏爱共享内存加同步的方式。
+  Go 是最早把 CSP 原则放进核心、并带给大众的语言之一，它的成功也促使其他语言尝试加入类似原语。
+</p>
+
+<div class="box note">
+  <div class="t">&#9432; 共享内存并不「邪恶」</div>
+  <p>
+    内存访问同步本身不坏，后面会看到某些场景下（即使在 Go 里）共享内存才是对的。只是共享内存模型很难用对，尤其在大型复杂程序里。
+    Go 从一开始就按 CSP 原则设计，因此并发代码更容易读、写和推理。
+  </p>
+</div>
+
+<h2 id="helps">这对你有什么帮助</h2>
+
+<p>
+  如果要类比，可以把 goroutine 比作线程、把通道比作互斥锁（二者只是「有点像」，这个类比只是帮你找到方向）。
+  这些不同的抽象带来了什么？
+</p>
+
+<p>
+  <strong>goroutine 让你不必用「并行」的方式思考问题，而是可以贴近问题本来的并发结构来建模。</strong>
+  比如要写一个 Web 服务器处理某个接口的请求。在只有线程抽象的语言里，你多半会纠结：
+</p>
+
+<div class="vs">
+  <div class="old">
+    <div class="h">只有线程时，你在想……</div>
+    <ul style="margin:10px 14px 12px 4px">
+      <li>语言原生支持线程吗？还是要选个库？</li>
+      <li>线程隔离（confinement）的边界划在哪？</li>
+      <li>这个操作系统上线程有多重？</li>
+      <li>不同操作系统处理线程有什么区别？</li>
+      <li>要建个 worker 池限制线程数，最优数量是多少？</li>
+    </ul>
+  </div>
+  <div class="new">
+    <div class="h">用 goroutine 时，你在想……</div>
+    <ul style="margin:10px 14px 12px 4px">
+      <li>每个用户连上来、开一个会话；</li>
+      <li>会话处理请求、返回响应；</li>
+      <li>→ 每个连接一个 goroutine，处理完就返回。</li>
+      <li style="color:var(--fg-faint)">（问题自然的样子，直接映射成代码）</li>
+    </ul>
+  </div>
+</div>
+
+<p>
+  左边的问题都很重要，但没有一个和你要解决的问题直接相关 —— 你一下子被拽进了「怎样实现并行」的技术细节里。
+  这一切之所以可行，是因为 Go 向我们承诺：<strong>goroutine 是轻量的，通常不需要担心创建它们的成本</strong>。
+  系统里跑了多少 goroutine 有时确实值得关心，但一开始就考虑这个，属于<strong>过早优化</strong>；而对线程，你最好一开始就考虑。
+</p>
+
+<p>
+  「某些语言也有框架帮你屏蔽并行的细节」并不意味着这种自然的建模方式不重要：框架总得有人写，你的代码就坐在作者处理过的那堆复杂性上面。
+  复杂性被藏起来不代表它不存在，而复杂性滋生 bug。Go 语言本身是围绕并发设计的，原语和语言浑然一体，摩擦更少、bug 更少。
+</p>
+
+<p>这种更自然的映射还带来几个附带好处：</p>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#9881;</span><h4>关注点分离</h4><p>运行时负责把 goroutine 复用到线程、负责调度。运行时变快了，你的程序不用改就跟着变快，比如 Go 1.5 修改了 goroutine 的调度顺序。</p></div>
+  <div class="card"><span class="ic">&#128064;</span><h4>运行时能「看见」阻塞</h4><p>goroutine 在等 I/O 时，运行时能察觉并把线程让给其他未阻塞的 goroutine（第 6 章详解）。</p></div>
+  <div class="card"><span class="ic">&#128200;</span><h4>更细的并发粒度</h4><p>每个用户一个 goroutine，而不是把连接复用到线程池上。粒度越细，程序越能随宿主机的并行能力动态伸缩 —— 阿姆达尔定律在起作用。</p></div>
+  <div class="card"><span class="ic">&#129513;</span><h4>通道天生可组合</h4><p>可以把多个子系统的输出组合起来，结合超时、取消、给其他子系统发消息。协调一堆互斥锁则困难得多。</p></div>
+</div>
+
+<p>
+  <code>select</code> 语句是通道的好搭档，让组合通道的难点迎刃而解：它可以高效地等待事件、在多个就绪的通道中均匀随机地选一个、没有消息就继续往下走……
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：「白送」的运行时改进确实一直在来</div>
+  <p>
+    书中说「关注 Go 的发布说明，运行时会在你不改代码的情况下让程序更快」。此后的几个例子：
+    <span class="ver">Go 1.14</span> 引入<strong>异步抢占</strong>，没有函数调用的死循环也不会再霸占线程（第 6 章）；
+    <span class="ver">Go 1.25</span> 起 <code>GOMAXPROCS</code> 默认会<strong>感知容器的 CPU 配额</strong>，在 Kubernetes 里不再需要第三方库 <code>automaxprocs</code>；
+    <span class="ver">Go 1.26</span> 默认启用新的 Green Tea 垃圾回收器。这些都只需要升级 Go 版本、重新编译。
+  </p>
+</div>
+
+<h2 id="philosophy">Go 的并发哲学</h2>
+
+<p>
+  CSP 是 Go 设计的核心，但 Go 同样支持传统的内存访问同步：<code>sync</code> 等包里的结构体和方法可以加锁、建资源池、抢占 goroutine 等等。
+  能二选一是好事，但也会让人困惑。新手常以为 CSP 风格是 Go 里写并发的<em>唯一</em>正确方式，比如 <code>sync</code> 包文档写道：
+</p>
+
+<blockquote style="margin:16px 0;padding:10px 18px;border-left:3px solid var(--line-2);color:var(--fg-soft)">
+  sync 包提供基本的同步原语，如互斥锁。除了 Once 和 WaitGroup 类型，大多数是给底层库例程用的。更高层的同步最好通过通道和通信来完成。
+</blockquote>
+
+<p>Go 的 FAQ 里写着：</p>
+
+<blockquote style="margin:16px 0;padding:10px 18px;border-left:3px solid var(--line-2);color:var(--fg-soft)">
+  关于互斥锁，sync 包实现了它们，但我们希望 Go 的编程风格能鼓励大家尝试更高层的技术。特别是，考虑把程序组织成：同一时刻只有一个 goroutine 负责某一份数据。<br>
+  <strong>不要通过共享内存来通信；而要通过通信来共享内存。</strong>
+</blockquote>
+
+<p>可你在实际代码里又经常看到互斥锁，也会听到有人抱怨通道被滥用，Go 团队成员也说用锁没问题。Go Wiki 的说法是：</p>
+
+<blockquote style="margin:16px 0;padding:10px 18px;border-left:3px solid var(--line-2);color:var(--fg-soft)">
+  Go 的格言之一是「通过通信共享内存，而不是通过共享内存通信」。尽管如此，Go 在 sync 包里也提供了传统的锁机制。大多数加锁问题用通道或传统锁都能解决。<br>
+  那么该用哪个？<strong>用最有表现力和/或最简单的那个。</strong>
+</blockquote>
+
+<p>
+  好建议，但有点模糊。怎么判断哪个「更有表现力、更简单」？关键在于：你管理并发的范围是<strong>在一个很小的作用域内部</strong>，还是<strong>贯穿整个系统</strong>。
+  作者把判断依据整理成了一棵决策树：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 400" role="img" aria-label="选择互斥锁还是通道的决策树">
+  <!-- 问题框 -->
+  <rect class="bx" x="240" y="16" width="280" height="44" rx="10"/>
+  <text class="ttl" x="380" y="43" text-anchor="middle">① 这是性能关键的代码段吗？</text>
+
+  <rect class="bx" x="240" y="100" width="280" height="44" rx="10"/>
+  <text class="ttl" x="380" y="127" text-anchor="middle">② 你是在转移数据的所有权吗？</text>
+
+  <rect class="bx" x="240" y="184" width="280" height="44" rx="10"/>
+  <text class="ttl" x="380" y="211" text-anchor="middle">③ 你在保护结构体的内部状态吗？</text>
+
+  <rect class="bx" x="240" y="268" width="280" height="44" rx="10"/>
+  <text class="ttl" x="380" y="295" text-anchor="middle">④ 你在协调多段逻辑吗？</text>
+
+  <!-- 结果框 -->
+  <rect class="bx-a" x="20" y="340" width="190" height="46" rx="10"/>
+  <text class="ttl on-a" x="115" y="368" text-anchor="middle">用原语（sync.Mutex 等）</text>
+  <rect class="bx-c" x="550" y="340" width="190" height="46" rx="10"/>
+  <text class="ttl on-c" x="645" y="368" text-anchor="middle">用通道（channel）</text>
+
+  <!-- No 向下 -->
+  <path class="ln" d="M380 60 V96" marker-end="url(#ar)"/><text class="sm" x="388" y="83">否</text>
+  <path class="ln" d="M380 144 V180" marker-end="url(#ar)"/><text class="sm" x="388" y="167">否</text>
+  <path class="ln" d="M380 228 V264" marker-end="url(#ar)"/><text class="sm" x="388" y="251">否</text>
+
+  <!-- ① 是 → 原语 -->
+  <path class="ln-a" d="M240 38 H70 V336" marker-end="url(#ar-a)"/><text class="sm on-a" x="216" y="30">是</text>
+  <!-- ③ 是 → 原语 -->
+  <path class="ln-a" d="M240 206 H140 V336" marker-end="url(#ar-a)"/><text class="sm on-a" x="216" y="198">是</text>
+  <!-- ④ 否 → 原语 -->
+  <path class="ln-a" d="M240 290 H180 V336" marker-end="url(#ar-a)"/><text class="sm on-a" x="216" y="282">否</text>
+  <!-- ② 是 → 通道 -->
+  <path class="ln-c" d="M520 122 H690 V336" marker-end="url(#ar-c)"/><text class="sm on-c" x="530" y="114">是</text>
+  <!-- ④ 是 → 通道 -->
+  <path class="ln-c" d="M520 290 H600 V336" marker-end="url(#ar-c)"/><text class="sm on-c" x="530" y="282">是</text>
+</svg>
+<figcaption>图 2-4　决策树（重绘自原书图 2-1）：从上往下逐个回答</figcaption>
+</figure>
+
+<h3 id="q-ownership">② 你是在转移数据的所有权吗？</h3>
+<p>
+  如果一段代码产生了结果，想交给另一段代码，你实际上是在<strong>转移这份数据的所有权</strong>。
+  熟悉没有垃圾回收的语言的人会懂：数据有一个主人，让并发程序安全的一种办法就是保证同一时刻只有一个并发上下文拥有这份数据。
+  通道把这种意图编码进了通道的类型里。
+</p>
+<ul>
+  <li>可以用<strong>带缓冲的通道</strong>实现一个廉价的内存队列，让生产者和消费者解耦；</li>
+  <li>用了通道，你的并发代码就天然能和其他并发代码<strong>组合</strong>。</li>
+</ul>
+
+<h3 id="q-internal">③ 你在保护结构体的内部状态吗？</h3>
+<p>
+  这正是内存访问同步原语的用武之地，也是一个很强的「不要用通道」的信号。用锁可以把「加锁」这个实现细节对调用者隐藏起来。
+  下面是一个线程安全、却不向调用者暴露复杂性的小类型：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+type Counter struct {
+	mu    sync.Mutex
+	value int
+}
+
+func (c *Counter) Increment() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.value++
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 170" role="img" aria-label="锁被封装在类型内部，调用者只看到 Increment 方法">
+  <rect class="bx-d" x="300" y="20" width="300" height="130" rx="12"/>
+  <text class="ttl" x="450" y="42" text-anchor="middle">Counter（类型边界）</text>
+  <rect class="bx-a" x="330" y="58" width="110" height="40" rx="8"/>
+  <text class="mono on-a" x="385" y="83" text-anchor="middle">mu (锁)</text>
+  <rect class="bx" x="460" y="58" width="110" height="40" rx="8"/>
+  <text class="mono" x="515" y="83" text-anchor="middle">value</text>
+  <text class="sm" x="450" y="124" text-anchor="middle">锁的存在被藏在里面，作用域非常小</text>
+  <circle class="dot-b" cx="80" cy="60" r="16"/><text class="sm" x="80" y="64" text-anchor="middle" style="fill:#fff">G1</text>
+  <circle class="dot-p" cx="80" cy="110" r="16"/><text class="sm" x="80" y="114" text-anchor="middle" style="fill:#fff">G2</text>
+  <path class="ln-b" d="M98 60 H296" marker-end="url(#ar-b)"/>
+  <path class="ln-p" d="M98 110 H296" marker-end="url(#ar-p)"/>
+  <text class="mono" x="200" y="52" text-anchor="middle">c.Increment()</text>
+  <text class="mono" x="200" y="102" text-anchor="middle">c.Increment()</text>
+  <text class="lbl" x="680" y="80" text-anchor="middle">对调用者而言，</text>
+  <text class="lbl" x="680" y="100" text-anchor="middle">Increment 就是原子的</text>
+</svg>
+<figcaption>图 2-5　用锁定义了 Counter 类型的「原子性范围」</figcaption>
+</figure>
+
+<p>
+  回忆原子性的概念：我们在这里为 <code>Counter</code> 类型定义了原子性的范围 —— 对 <code>Increment</code> 的调用可以视为原子的。
+  关键词是<strong>内部</strong>：如果你发现自己把锁暴露到了类型之外，就该亮红灯了。尽量把锁限制在很小的词法作用域里。
+</p>
+
+<h3 id="q-coordinate">④ 你在协调多段逻辑吗？</h3>
+<p>
+  通道天生比内存同步原语更容易组合。锁散落在整个对象图里听起来像噩梦，但到处都是通道却是正常、被鼓励的！
+  你可以组合通道，却很难组合锁或「返回值的方法」。
+  有了 <code>select</code>，加上通道可以当队列用、可以安全地到处传递，你会发现用通道更容易控制软件里涌现出来的复杂性。
+  <strong>如果你在用原语，却搞不清并发代码是怎么运行的、为什么死锁或出现竞态，这多半意味着你该换成通道了。</strong>
+</p>
+
+<h3 id="q-perf">① 这是性能关键的代码段吗？</h3>
+<p>
+  这<strong>绝不是说</strong>「我想要程序快，所以只用互斥锁」。它的意思是：如果你<em>经过性能剖析</em>发现某段代码是主要瓶颈、比其他部分慢好几个数量级，
+  那么用内存同步原语可能有助于它在负载下的表现 —— 因为通道内部本身就用了内存同步，所以只可能更慢。
+  不过在考虑这个之前，一个性能关键段也可能在暗示：程序结构需要调整。
+</p>
+
+<div class="box tip">
+  <div class="t">&#10003; 忘掉线程时代的「池化」习惯</div>
+  <p>
+    在以线程为抽象的语言里，线程池之类的模式很常见。它们大多是为了扬长避短地使用线程而存在的。
+    在 Go 里一个好的经验法则是：<strong>丢掉这些模式</strong>。它们并非完全没用，但在 Go 里适用面窄得多。
+    用 goroutine 表示工作流中的并发部分，大胆地启动它们。你更可能需要重构程序，而不是先撞上硬件能支持的 goroutine 数量上限。
+  </p>
+</div>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：需要「限制并发数」时怎么写</div>
+  <p>
+    不预先建 goroutine 池，不等于并发数永远不设上限 —— 比如同时发起的 HTTP 请求、打开的文件数。今天常见的做法是：
+    用 <code>golang.org/x/sync/errgroup</code> 的 <code>g.SetLimit(n)</code>，或者用一个容量为 n 的带缓冲通道当信号量，按需启动 goroutine 但限制同时运行的数量。
+    这仍然是「每个任务一个 goroutine」的思路，而不是「固定 n 个 worker 循环取任务」。
+  </p>
+  <div class="code" data-lang="go" data-tone="modern" data-file="新写法：限制同时运行的 goroutine 数">
+<pre>
+var g errgroup.Group
+g.SetLimit(8) // 最多 8 个同时运行，第 9 个 g.Go 会阻塞等待
+for _, url := range urls {
+	g.Go(func() error { return fetch(url) }) // Go 1.22+ 循环变量每轮独立，可直接引用
+}
+if err := g.Wait(); err != nil { // 返回第一个非 nil 错误
+	log.Fatal(err)
+}
+</pre>
+  </div>
+</div>
+
+<div class="box key">
+  <div class="t">&#9733; 一句话概括 Go 的并发哲学</div>
+  <p><strong>追求简单；能用通道就用通道；把 goroutine 当作免费资源。</strong></p>
+</div>
+
+<div class="exercise">
+  <h3>&#9998; 动手练习</h3>
+  <ol>
+    <li>用自己的话向同事解释：为什么说「我们从不写并行代码」？</li>
+    <li>把下面几个场景放进决策树，看看该用锁还是通道：①缓存的内部 map；②下载器把下载好的文件交给解压器；③统计请求总数；④多个子任务任何一个失败就全部取消。</li>
+    <li>把 <code>Counter</code> 改用 <code>atomic.Int64</code> 实现。思考：如果 Counter 还要维护「最大值」字段、并保证两个字段一起更新，atomic 还够用吗？</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

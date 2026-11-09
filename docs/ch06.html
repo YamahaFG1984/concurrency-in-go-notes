@@ -1,0 +1,594 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 6 章 · goroutine 与 Go 运行时 — Go 并发编程图解笔记</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="6">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 6 章</span>
+<h1>goroutine 与 Go 运行时</h1>
+<p class="lede">
+  在 Go 里用并发很爽，因为语言把它变得太简单了，我们很少需要了解运行时在底下是怎样把一切缝合起来的。
+  但第 2 章讲的那些好处，全都是运行时的功劳。这一章掀开盖子，看看 Go 怎样把成千上万个 goroutine 高效地调度到少数几个线程上 ——
+  这既有用，也很有趣。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解为什么「公平调度」和「中央队列」在 fork-join 模型下表现不佳</li>
+    <li>掌握工作窃取（work stealing）算法的四条规则，并能一步步推演</li>
+    <li>理解「窃取任务」和「窃取延续」的区别，以及书中的观点与当前运行时实现的差异</li>
+    <li>认识调度器的 G、M、P 三个概念，以及系统调用、全局队列、抢占这些优化</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<!-- ============================================================ -->
+<h2 id="naive">先看几种「天真」的调度策略</h2>
+
+<p>
+  第 2、3 章说过，Go 会替你把 goroutine 复用到操作系统线程上，它用的算法叫<strong>工作窃取（work stealing）</strong>。在讲它之前，先看看几种更简单的方案为什么不够好。
+</p>
+
+<h3 id="fair">公平调度</h3>
+
+<p>
+  为了让所有处理器都被平均利用，最简单的办法是把负载均分：有 n 个处理器、x 个任务，每个处理器分 x/n 个。比如两个处理器 P1、P2，四个任务 T1～T4，P1 拿 T1、T3，P2 拿 T2、T4。
+</p>
+
+<p>
+  问题在于 Go 使用 <strong>fork-join 模型</strong>：任务之间很可能互相依赖，简单地切分会让某个处理器闲着，还会破坏<strong>缓存局部性</strong>（需要相同数据的任务被分到了别的处理器上）。看两种情况：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="公平调度的两个问题：任务长短不一导致空闲，任务依赖导致阻塞">
+  <text class="ttl" x="20" y="24">① 任务 2 比任务 1 + 任务 3 加起来还长</text>
+  <text class="lbl" x="20" y="60">P1</text><text class="lbl" x="20" y="94">P2</text>
+  <rect class="bx-b" x="60" y="44" width="120" height="26" rx="5"/><text class="sm on-b" x="120" y="62" text-anchor="middle">T1</text>
+  <rect class="bx-b" x="180" y="44" width="120" height="26" rx="5"/><text class="sm on-b" x="240" y="62" text-anchor="middle">T3</text>
+  <rect class="bx-d" x="300" y="44" width="160" height="26" rx="5"/><text class="sm" x="380" y="62" text-anchor="middle">空闲 😴</text>
+  <rect class="bx-p" x="60" y="78" width="400" height="26" rx="5"/><text class="sm on-p" x="260" y="96" text-anchor="middle">T2（很长）</text>
+  <rect class="bx-p" x="460" y="78" width="100" height="26" rx="5"/><text class="sm on-p" x="510" y="96" text-anchor="middle">T4</text>
+  <text class="sm" x="580" y="62">P1 明明可以帮忙做 T4</text>
+
+  <text class="ttl" x="20" y="150">② 任务 1 依赖任务 4 的结果</text>
+  <text class="lbl" x="20" y="186">P1</text><text class="lbl" x="20" y="220">P2</text>
+  <rect class="bx-r" x="60" y="170" width="400" height="26" rx="5"/><text class="sm on-r" x="260" y="188" text-anchor="middle">T1 阻塞：等 T4（而 T4 还排在 P2 后面）</text>
+  <rect class="bx-b" x="460" y="170" width="100" height="26" rx="5"/><text class="sm on-b" x="510" y="188" text-anchor="middle">T1</text>
+  <rect class="bx-b" x="560" y="170" width="100" height="26" rx="5"/><text class="sm on-b" x="610" y="188" text-anchor="middle">T3</text>
+  <rect class="bx-p" x="60" y="204" width="240" height="26" rx="5"/><text class="sm on-p" x="180" y="222" text-anchor="middle">T2</text>
+  <rect class="bx-p" x="300" y="204" width="160" height="26" rx="5"/><text class="sm on-p" x="380" y="222" text-anchor="middle">T4</text>
+  <rect class="bx-d" x="460" y="204" width="200" height="26" rx="5"/><text class="sm" x="560" y="222" text-anchor="middle">空闲</text>
+  <path class="ln" d="M60 246 H700" marker-end="url(#ar)"/><text class="sm" x="708" y="250">时间</text>
+</svg>
+<figcaption>图 6-1　公平调度：静态均分在 fork-join 世界里会浪费处理器</figcaption>
+</figure>
+
+<p>第二种情况下，P1 被 T1 阻塞时，本可以先去做 T4 来解除自己的阻塞。</p>
+
+<h3 id="central">中央 FIFO 队列</h3>
+
+<p>
+  听起来是负载均衡问题，用一个 FIFO 队列试试：任务进队列，处理器有空就出队取任务，或在汇合点阻塞。这是第一种工作窃取算法。
+  它解决了处理器闲置的问题，但引入了一个所有处理器都要使用的<strong>中心化数据结构</strong>。第 1 章说过，频繁进出临界区代价很高；而且缓存局部性更差了：每个处理器每次入队出队都要把这个中央队列加载到自己的缓存里。
+  对粗粒度的操作这也许可行，但 goroutine 通常是<strong>细粒度</strong>的，所以中央队列不是好选择。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="中央队列与每个线程一个双端队列的对比">
+  <text class="ttl on-r" x="185" y="24" text-anchor="middle">中央队列：所有人抢一把锁</text>
+  <text class="ttl on-g" x="575" y="24" text-anchor="middle">分散的双端队列：各管各的</text>
+  <path class="ln-d" d="M380 12 V210"/>
+  <rect class="bx-r" x="105" y="50" width="160" height="40" rx="8"/>
+  <text class="mono on-r" x="185" y="75" text-anchor="middle">[T1 T2 T3 T4 …]</text>
+  <rect class="bx-b" x="40" y="150" width="80" height="40" rx="8"/><text class="sm on-b" x="80" y="175" text-anchor="middle">P1</text>
+  <rect class="bx-b" x="145" y="150" width="80" height="40" rx="8"/><text class="sm on-b" x="185" y="175" text-anchor="middle">P2</text>
+  <rect class="bx-b" x="250" y="150" width="80" height="40" rx="8"/><text class="sm on-b" x="290" y="175" text-anchor="middle">P3</text>
+  <path class="ln-r" d="M80 148 L160 94 M185 148 V94 M290 148 L210 94"/>
+  <text class="sm on-r" x="185" y="124" text-anchor="middle">争用 + 缓存来回搬</text>
+
+  <rect class="bx-b" x="420" y="60" width="90" height="40" rx="8"/><text class="sm on-b" x="465" y="85" text-anchor="middle">P1</text>
+  <rect class="bx-c" x="420" y="110" width="90" height="70" rx="8"/><text class="mono on-c" x="465" y="134" text-anchor="middle">deque</text><text class="sm" x="465" y="156" text-anchor="middle">T1 T3</text>
+  <rect class="bx-b" x="530" y="60" width="90" height="40" rx="8"/><text class="sm on-b" x="575" y="85" text-anchor="middle">P2</text>
+  <rect class="bx-c" x="530" y="110" width="90" height="70" rx="8"/><text class="mono on-c" x="575" y="134" text-anchor="middle">deque</text><text class="sm" x="575" y="156" text-anchor="middle">T2</text>
+  <rect class="bx-b" x="640" y="60" width="90" height="40" rx="8"/><text class="sm on-b" x="685" y="85" text-anchor="middle">P3</text>
+  <rect class="bx-c" x="640" y="110" width="90" height="70" rx="8"/><text class="mono on-c" x="685" y="134" text-anchor="middle">deque</text><text class="sm" x="685" y="156" text-anchor="middle">（空）</text>
+  <path class="ln-g" d="M465 102 V108 M575 102 V108 M685 102 V108"/>
+  <path class="ln-a" style="stroke-dasharray:4 4" d="M640 160 C 610 196, 500 200, 470 182" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="575" y="204" text-anchor="middle">P3 空闲时，从别人那里「偷」</text>
+</svg>
+<figcaption>图 6-2　从中央队列到「每个线程一个双端队列（deque）」</figcaption>
+</figure>
+
+<p>
+  下一步是<strong>去中心化</strong>：给每个处理器一个线程和一个<strong>双端队列（deque）</strong>。高争用的中央数据结构没了，但新问题来了：
+  如果工作从 P1 开始，所有 fork 出来的任务都放在 P1 的队列里，工作怎么流到 P2？任务在队列之间移动，会不会又有上下文切换的问题？
+</p>
+
+<!-- ============================================================ -->
+<h2 id="rules">工作窃取的四条规则</h2>
+
+<p>
+  回忆一下：Go 遵循 fork-join 模型。<strong>fork</strong> 是启动 goroutine；<strong>汇合点（join point）</strong>是两个或多个 goroutine 通过通道或 sync 包里的类型同步的地方。
+  对一个执行线程来说，工作窃取算法遵循几条基本规则：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="工作窃取的规则：在自己队列尾部压入弹出，从别人队列头部窃取">
+  <rect class="bx-b" x="40" y="30" width="120" height="44" rx="10"/><text class="ttl on-b" x="100" y="57" text-anchor="middle">线程 T1</text>
+  <rect class="bx-c" x="200" y="34" width="70" height="36" rx="6"/><text class="mono on-c" x="235" y="57" text-anchor="middle">A</text>
+  <rect class="bx-c" x="274" y="34" width="70" height="36" rx="6"/><text class="mono on-c" x="309" y="57" text-anchor="middle">B</text>
+  <rect class="bx-c" x="348" y="34" width="70" height="36" rx="6"/><text class="mono on-c" x="383" y="57" text-anchor="middle">C</text>
+  <text class="sm" x="235" y="90" text-anchor="middle">头（head）</text>
+  <text class="sm" x="383" y="90" text-anchor="middle">尾（tail）</text>
+  <path class="ln-a" d="M470 44 H424" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="476" y="40">① fork 时：压入自己的队尾</text>
+  <path class="ln-g" d="M424 64 H470" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="476" y="72">③ 汇合点还没就绪：从自己的队尾弹出</text>
+
+  <rect class="bx-p" x="40" y="150" width="120" height="44" rx="10"/><text class="ttl on-p" x="100" y="177" text-anchor="middle">线程 T2（空闲）</text>
+  <path class="ln-p" d="M164 160 C 200 130, 215 100, 232 74" marker-end="url(#ar-p)"/>
+  <text class="sm on-p" x="210" y="160">② 闲着：从随机一个其他线程的队头偷</text>
+  <text class="sm on-p" x="210" y="178">④ 自己的队列空了：要么在汇合点停顿，</text>
+  <text class="sm on-p" x="210" y="196">　 要么从随机其他线程的队头偷</text>
+  <text class="lbl" x="380" y="230" text-anchor="middle">主人在尾部操作（像栈），小偷在头部操作 —— 两者很少撞在一起</text>
+</svg>
+<figcaption>图 6-3　工作窃取：自己用队尾，别人偷队头</figcaption>
+</figure>
+
+<ol>
+  <li>在 fork 点，把任务加到当前线程的 deque 的<strong>尾部</strong>；</li>
+  <li>如果线程空闲，从随机选择的另一个线程的 deque <strong>头部</strong>偷取工作；</li>
+  <li>在一个还无法实现的汇合点（与之同步的 goroutine 还没完成），从<strong>自己</strong> deque 的<strong>尾部</strong>弹出工作；</li>
+  <li>如果自己的 deque 空了：要么 a) 在汇合点停顿（stall），要么 b) 从随机另一个线程的 deque 头部偷取工作。</li>
+</ol>
+
+<p>来看真实代码。下面的程序用递归计算斐波那契数列：</p>
+
+<div class="code" data-lang="go">
+<pre>
+var fib func(n int) &lt;-chan int
+fib = func(n int) &lt;-chan int {
+	result := make(chan int)
+	go func() {
+		defer close(result)
+		if n &lt;= 2 {
+			result &lt;- 1
+			return
+		}
+		result &lt;- &lt;-fib(n-1) + &lt;-fib(n-2)
+	}()
+	return result
+}
+
+fmt.Printf("fib(4) = %d", &lt;-fib(4))
+</pre>
+</div>
+
+<p>
+  假设程序跑在一台有两个单核处理器的假想机器上，每个处理器一个 OS 线程：T1 和 T2。下面一步步看工作窃取算法怎样运行这个程序（实际上这一切都不是确定的，这里为了说明选了一种可能的顺序）。
+  点击按钮逐步查看：
+</p>
+
+<div class="stepper" id="task-stepper">
+  <div class="head">
+    <span class="ttl">演示 1：窃取「任务」（goroutine）</span>
+    <span class="ctrl"><button type="button" data-act="prev">‹ 上一步</button><span class="count"></span><button type="button" data-act="next">下一步 ›</button><button type="button" data-act="reset">重来</button></span>
+  </div>
+  <div class="desc"></div>
+  <div class="board"></div>
+</div>
+
+<p>工作在 deque 尾部有两个很有用的性质：</p>
+<ul>
+  <li><strong>它最可能是完成父亲的汇合所需要的工作。</strong>越快完成汇合，程序越可能跑得好，内存里需要保存的东西也越少。</li>
+  <li><strong>它最可能还在处理器的缓存里。</strong>它是线程在当前工作之前刚处理过的，数据很可能还在这个 CPU 的缓存中，缓存未命中更少。</li>
+</ul>
+<p>总之，这样调度工作有很多隐含的性能好处。</p>
+
+<!-- ============================================================ -->
+<h2 id="cont">窃取任务还是窃取延续？</h2>
+
+<p>
+  一直没细说的问题是：我们入队和窃取的到底是什么？在 fork-join 模式下有两种选择：<strong>任务（task）</strong>和<strong>延续（continuation）</strong>。
+  再看一次斐波那契程序：
+</p>
+
+<div class="code" data-lang="go">
+<pre>
+var fib func(n int) &lt;-chan int
+fib = func(n int) &lt;-chan int {
+	result := make(chan int)
+	go func() { // ← 在 Go 里，goroutine 就是「任务」
+		defer close(result)
+		if n &lt;= 2 {
+			result &lt;- 1
+			return
+		}
+		result &lt;- &lt;-fib(n-1) + &lt;-fib(n-2)
+	}()
+	return result // ← go 语句之后的所有东西，就是「延续」
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 170" role="img" aria-label="go 语句把执行分成任务和延续两部分">
+  <rect class="bx-a" x="20" y="60" width="160" height="50" rx="10"/>
+  <text class="mono on-a" x="100" y="90" text-anchor="middle">go func(){...}()</text>
+  <path class="ln-c" d="M182 72 C 240 40, 280 34, 330 34" marker-end="url(#ar-c)"/>
+  <path class="ln-p" d="M182 98 C 240 130, 280 136, 330 136" marker-end="url(#ar-p)"/>
+  <rect class="bx-c" x="334" y="14" width="406" height="42" rx="10"/>
+  <text class="ttl on-c" x="350" y="40">任务（task / child）</text><text class="sm" x="500" y="40">新 goroutine 里要执行的函数体</text>
+  <rect class="bx-p" x="334" y="114" width="406" height="42" rx="10"/>
+  <text class="ttl on-p" x="350" y="140">延续（continuation）</text><text class="sm" x="500" y="140">父 goroutine 在 go 语句之后要做的事</text>
+  <text class="lbl" x="560" y="90" text-anchor="middle">调度器只能先跑其中一个，另一个放进队列等着被执行或被偷</text>
+</svg>
+<figcaption>图 6-4　每个 go 语句都把执行一分为二</figcaption>
+</figure>
+
+<p>
+  上面的推演里，我们入队和窃取的是<strong>任务</strong>（goroutine）。goroutine 很好地封装了一块工作，这是很自然的想法。但书中指出，Go 的工作窃取算法入队和窃取的是<strong>延续</strong>。这有什么区别？
+</p>
+
+<p>
+  在算法里，线程到达一个未实现的汇合点时，必须暂停执行、去找任务来偷，这叫<strong>停顿的汇合（stalling join）</strong>。任务窃取和延续窃取都会有停顿的汇合，但发生的频率差别很大。考虑这几条公理：
+</p>
+<ul>
+  <li>创建 goroutine 时，程序很可能希望这个 goroutine 里的函数被执行；</li>
+  <li>延续很可能在某个时刻要和这个 goroutine 汇合；</li>
+  <li>延续在 goroutine 完成之前就尝试汇合，也很常见。</li>
+</ul>
+
+<p>
+  基于这些，调度 goroutine 时<strong>立即开始执行它</strong>是合理的。再结合「线程在自己队尾压入弹出、别人从队头偷」的性质：如果把<strong>延续</strong>压到队尾，它最不容易被从队头偷的其他线程偷走，
+  于是执行完 goroutine 后很可能直接把它拿回来继续，避免停顿。这让 fork 出来的任务看起来很像一次<strong>函数调用</strong>：线程跳去执行 goroutine，结束后再回到延续。
+  用延续窃取重新推演一遍（入队的延续记作「cont. of X」）：
+</p>
+
+<div class="stepper" id="cont-stepper">
+  <div class="head">
+    <span class="ttl">演示 2：窃取「延续」</span>
+    <span class="ctrl"><button type="button" data-act="prev">‹ 上一步</button><span class="count"></span><button type="button" data-act="next">下一步 ›</button><button type="button" data-act="reset">重来</button></span>
+  </div>
+  <div class="desc"></div>
+  <div class="board"></div>
+</div>
+
+<p>对比两次运行的统计：</p>
+
+<div class="tw">
+<table>
+  <tr><th>统计项</th><th>延续窃取</th><th>任务窃取</th></tr>
+  <tr><td>步数</td><td>14</td><td>15</td></tr>
+  <tr><td>deque 最大长度</td><td>2</td><td>2</td></tr>
+  <tr><td>停顿的汇合</td><td>2（都在空闲线程上）</td><td>3（都在忙碌线程上）</td></tr>
+  <tr><td>调用栈大小</td><td>2</td><td>3</td></tr>
+</table>
+</div>
+
+<p>数字看起来接近，但放大到更大的程序，延续窃取的优势会很明显。再看<strong>只有一个线程</strong>时的运行情况：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 150" role="img" aria-label="单线程下延续窃取的执行顺序与普通函数调用相同">
+  <text class="lbl" x="20" y="24">单线程 T1 的执行顺序（延续窃取）：</text>
+  <rect class="bx" x="20" y="40" width="64" height="30" rx="6"/><text class="mono" x="52" y="60" text-anchor="middle">main</text>
+  <path class="ln" d="M86 55 H100" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="104" y="40" width="64" height="30" rx="6"/><text class="mono on-b" x="136" y="60" text-anchor="middle">fib(4)</text>
+  <path class="ln" d="M170 55 H184" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="188" y="40" width="64" height="30" rx="6"/><text class="mono on-b" x="220" y="60" text-anchor="middle">fib(3)</text>
+  <path class="ln" d="M254 55 H268" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="272" y="40" width="64" height="30" rx="6"/><text class="mono on-b" x="304" y="60" text-anchor="middle">fib(2)</text>
+  <path class="ln" d="M338 55 H352" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="356" y="40" width="64" height="30" rx="6"/><text class="mono on-b" x="388" y="60" text-anchor="middle">fib(1)</text>
+  <path class="ln" d="M422 55 H436" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="440" y="40" width="70" height="30" rx="6"/><text class="mono on-g" x="475" y="60" text-anchor="middle">返回 2</text>
+  <path class="ln" d="M512 55 H526" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="530" y="40" width="64" height="30" rx="6"/><text class="mono on-b" x="562" y="60" text-anchor="middle">fib(2)</text>
+  <path class="ln" d="M596 55 H610" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="614" y="40" width="70" height="30" rx="6"/><text class="mono on-g" x="649" y="60" text-anchor="middle">返回 3</text>
+  <path class="ln" d="M686 55 H700" marker-end="url(#ar)"/>
+  <text class="mono" x="706" y="60">print</text>
+  <text class="lbl" x="380" y="104" text-anchor="middle">deque 里只放着 main 和 fib(4)/fib(3) 的延续，依次弹出继续 ——</text>
+  <text class="lbl" x="380" y="126" text-anchor="middle">和直接用普通函数递归的执行顺序完全一样！</text>
+</svg>
+<figcaption>图 6-5　单线程时，用 goroutine 和用普通函数的运行方式相同 —— 这是延续窃取的另一个好处</figcaption>
+</figure>
+
+<div class="tw">
+<table>
+  <tr><th></th><th>延续（continuation）</th><th>子任务（child）</th></tr>
+  <tr><td>队列大小</td><td>有界</td><td>无界</td></tr>
+  <tr><td>执行顺序</td><td>串行</td><td>乱序</td></tr>
+  <tr><td>汇合点</td><td>不停顿</td><td>停顿</td></tr>
+</table>
+</div>
+
+<p>
+  综合来看，窃取延续在理论上优于窃取任务。为什么不是所有工作窃取算法都这样实现？因为延续窃取通常需要<strong>编译器的支持</strong>。
+  书中认为 Go 有自己的编译器，所以 Go 的工作窃取算法实现的是延续窃取；没有这种条件的语言通常以库的形式实现任务（即「子任务」）窃取。
+</p>
+
+<div class="box deep">
+  <div class="t">&#128270; 勘误与补充：今天的 Go 运行时其实是怎样做的</div>
+  <p>
+    书中「Go 窃取的是延续」的说法，与当前 Go 运行时的源码并不一致，请把它理解为一种理论模型。查看 Go 1.27 的 <code>runtime/proc.go</code>：
+    <code>go</code> 语句编译为对 <code>newproc</code> 的调用，它创建新的 G，然后执行 <code>runqput(pp, newg, true)</code> ——
+    把<strong>新 goroutine（子任务）</strong>放进当前 P 的 <code>runnext</code> 槽位，<strong>父 goroutine（延续）继续运行</strong>。
+    当父 goroutine 很快在汇合点阻塞（比如等通道）时，P 会优先运行 <code>runnext</code> 里的那个新 goroutine，于是同样获得了「刚创建的工作马上在同一个 CPU 上执行」的缓存局部性；
+    空闲的 P 则从别的 P 的本地队列偷走<strong>一半</strong>的 goroutine。也就是说，Go 实际做的是带 <code>runnext</code> 优化的「子任务窃取」，书中对延续窃取优势的分析，在思想层面仍然有助于理解调度器为什么要这样设计。
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="gmp">G、M、P：Go 调度器的三个概念</h2>
+
+<p>上面的模型已经很接近 Go 的算法，但还不是全貌，Go 还做了额外的优化。先换用 Go 调度器源码里的术语：</p>
+
+<dl class="terms">
+  <dt>G</dt><dd>一个 goroutine。注意它代表 goroutine 的<strong>当前状态</strong>，尤其是程序计数器（PC）。</dd>
+  <dt>M</dt><dd>一个 OS 线程（源码里也叫 machine）。</dd>
+  <dt>P</dt><dd>一个上下文（源码里也叫 processor）。</dd>
+</dl>
+
+<p>
+  在前面的讨论里，M 相当于 T，P 相当于工作队列（调整 <code>GOMAXPROCS</code> 改变的就是 P 的数量）。运行时启动若干 M，M 承载 P，P 再调度和承载 G：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="G-M-P 模型：M 是线程，P 持有本地运行队列，G 是 goroutine；还有全局队列和空闲线程池">
+  <!-- M1 -->
+  <rect class="bx-y" x="20" y="40" width="230" height="200" rx="14"/>
+  <text class="ttl on-y" x="135" y="62" text-anchor="middle">M（OS 线程）</text>
+  <rect class="bx-a" x="38" y="74" width="194" height="150" rx="12"/>
+  <text class="ttl on-a" x="135" y="96" text-anchor="middle">P（处理器 / 工作队列）</text>
+  <circle class="bx-c" cx="80" cy="130" r="20"/><text class="mono on-c" x="80" y="135" text-anchor="middle">G</text>
+  <text class="sm" x="80" y="166" text-anchor="middle">正在运行</text>
+  <rect class="bx-d" x="120" y="112" width="100" height="36" rx="6"/>
+  <text class="sm" x="170" y="128" text-anchor="middle">runnext</text><text class="mono" x="170" y="142" text-anchor="middle">G</text>
+  <rect class="bx" x="56" y="180" width="164" height="32" rx="6"/>
+  <text class="mono" x="138" y="201" text-anchor="middle">本地队列 G G G …</text>
+  <!-- M2 -->
+  <rect class="bx-y" x="280" y="40" width="200" height="200" rx="14"/>
+  <text class="ttl on-y" x="380" y="62" text-anchor="middle">M</text>
+  <rect class="bx-a" x="296" y="74" width="168" height="150" rx="12"/>
+  <text class="ttl on-a" x="380" y="96" text-anchor="middle">P</text>
+  <circle class="bx-c" cx="380" cy="132" r="20"/><text class="mono on-c" x="380" y="137" text-anchor="middle">G</text>
+  <rect class="bx" x="312" y="180" width="136" height="32" rx="6"/><text class="mono" x="380" y="201" text-anchor="middle">（空）</text>
+  <path class="ln-p" style="stroke-dasharray:4 4" d="M312 196 C 280 196, 260 196, 224 196" marker-end="url(#ar-p)"/>
+  <text class="sm on-p" x="268" y="258" text-anchor="middle">空了就偷一半</text>
+  <!-- global & idle -->
+  <rect class="bx-p" x="520" y="40" width="220" height="70" rx="12"/>
+  <text class="ttl on-p" x="630" y="64" text-anchor="middle">全局运行队列</text>
+  <text class="sm" x="630" y="86" text-anchor="middle">P 定期查看（每 61 次调度一次），</text>
+  <text class="sm" x="630" y="102" text-anchor="middle">本地队列空时也先看这里</text>
+  <rect class="bx-d" x="520" y="130" width="220" height="70" rx="12"/>
+  <text class="ttl" x="630" y="156" text-anchor="middle">空闲线程池</text>
+  <text class="sm" x="630" y="178" text-anchor="middle">没在用的 M 在这里睡觉</text>
+  <rect class="bx" x="520" y="220" width="220" height="40" rx="10"/>
+  <text class="sm" x="630" y="245" text-anchor="middle">P 的数量 = GOMAXPROCS</text>
+  <text class="lbl" x="380" y="300" text-anchor="middle">保证：始终至少有足够的 M 来承载每一个 P</text>
+  <text class="sm" x="380" y="320" text-anchor="middle">（M 的数量可以多于或少于核数，用于处理 GC、系统调用等）</text>
+</svg>
+<figcaption>图 6-6　M 承载 P，P 调度 G（重绘并扩展自原书示意图）</figcaption>
+</figure>
+
+<p>
+  <code>GOMAXPROCS</code> 控制运行时可用的上下文（P）数量，默认每个逻辑 CPU 一个。和 P 不同，OS 线程（M）可以比核数多或少，以便运行时处理垃圾回收、goroutine 等事务。
+  运行时有一个非常重要的保证：<strong>总有足够的 OS 线程来承载每一个上下文</strong>。运行时还有一个线程池，存放暂时不用的线程。这让下面的优化成为可能。
+</p>
+
+<h3 id="syscall">系统调用：把 P 交出去</h3>
+
+<p>
+  如果某个 goroutine 因为 I/O 或调用 Go 运行时之外的系统调用而阻塞，承载它的 OS 线程也会被阻塞，无法推进也无法承载别的 goroutine。逻辑上没问题，
+  但从性能上看，Go 可以做得更好，让机器上的处理器尽量保持忙碌。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="goroutine 阻塞在系统调用时，P 与 M 分离并转交给另一个 M">
+  <text class="ttl" x="20" y="24">① G1 在 M1 上发起阻塞的系统调用</text>
+  <rect class="bx-r" x="20" y="40" width="150" height="80" rx="12"/>
+  <text class="ttl on-r" x="95" y="62" text-anchor="middle">M1（被阻塞）</text>
+  <circle class="bx-c" cx="95" cy="94" r="18"/><text class="mono on-c" x="95" y="99" text-anchor="middle">G1</text>
+  <rect class="bx-a" x="210" y="50" width="130" height="60" rx="10"/>
+  <text class="ttl on-a" x="275" y="76" text-anchor="middle">P</text><text class="sm" x="275" y="96" text-anchor="middle">队列：G2 G3</text>
+  <path class="ln-a" d="M342 80 H436" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="390" y="70" text-anchor="middle">② P 脱离 M1</text>
+  <rect class="bx-g" x="440" y="40" width="160" height="80" rx="12"/>
+  <text class="ttl on-g" x="520" y="62" text-anchor="middle">M2（空闲线程）</text>
+  <text class="sm" x="520" y="86" text-anchor="middle">接手 P，继续运行</text>
+  <text class="mono" x="520" y="106" text-anchor="middle">G2、G3…</text>
+  <text class="sm" x="640" y="74">CPU 不闲着</text>
+
+  <text class="ttl" x="20" y="160">③ 系统调用返回后</text>
+  <text class="sm" x="20" y="186">M1 尝试从其他线程「偷回」一个 P 继续执行 G1；</text>
+  <text class="sm" x="20" y="206">如果拿不到，就把 G1 放进全局队列，M1 自己去线程池睡觉，等以后再被使用。</text>
+  <text class="sm" x="20" y="232">（网络 I/O 更进一步：由 netpoller 统一等待，goroutine 被挂起时根本不占用线程）</text>
+</svg>
+<figcaption>图 6-7　系统调用阻塞时，P 被转交给别的线程</figcaption>
+</figure>
+
+<p>
+  Go 的做法是：<strong>把上下文（P）从被阻塞的 OS 线程上分离</strong>，交给另一个未阻塞的线程，让这个 P 继续调度其他 goroutine，宿主机的 CPU 保持活跃。被阻塞的 goroutine 仍然和那个被阻塞的线程绑在一起。
+  当 goroutine 最终解除阻塞，宿主线程会尝试从其他线程那里偷回一个上下文，继续执行它。如果偷不到，线程就把 goroutine 放到<strong>全局上下文（全局队列）</strong>里，自己去睡觉，进入线程池以备将来使用。
+</p>
+
+<p>
+  全局队列在前面抽象的工作窃取算法里没有出现，它是 Go 为优化 CPU 利用率而引入的实现细节。为了保证放到全局队列里的 goroutine 不会永远待在那里，算法里加了几步：
+  上下文会<strong>定期</strong>检查全局队列；当自己的队列空了时，会<strong>先看全局队列</strong>，再去偷别的线程的工作。
+</p>
+
+<h3 id="preempt">抢占</h3>
+
+<p>
+  除了 I/O 和系统调用，Go 还允许 goroutine 在<strong>任何函数调用</strong>时被抢占。这与 Go 偏爱细粒度并发任务的理念相配合，保证运行时能高效地调度工作。
+  书中提到一个 Go 团队当时正在解决的例外：既没有 I/O、没有系统调用、也<strong>没有函数调用</strong>的 goroutine（比如一个紧密的纯计算循环）不可抢占，可能导致很长的 GC 等待，甚至死锁。
+</p>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：异步抢占解决了这个问题 <span class="ver">Go 1.14+</span></div>
+  <p>
+    书中提到的问题已经在 Go 1.14 解决：运行时会定期检查运行太久（约 10ms）的 goroutine，通过向线程发送信号（Unix 上是 <code>SIGURG</code>）<strong>异步抢占</strong>它，
+    即使是没有函数调用的死循环也能被打断。所以今天「一个 goroutine 霸占线程、让 GC 等很久」的情况基本不会再出现。
+  </p>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="Go 1.14 前后紧密循环的抢占行为对比">
+  <text class="ttl on-r" x="20" y="26">Go ≤ 1.13：只能在函数调用等「安全点」抢占</text>
+  <rect class="bx-r" x="20" y="40" width="560" height="30" rx="6"/>
+  <text class="mono on-r" x="300" y="60" text-anchor="middle">for { i++ }　// 没有函数调用：一直跑，没法被换下</text>
+  <text class="sm on-r" x="590" y="60">GC 只能干等</text>
+
+  <text class="ttl on-c" x="20" y="110">Go ≥ 1.14：基于信号的异步抢占</text>
+  <rect class="bx-c" x="20" y="124" width="120" height="30" rx="6"/><text class="mono on-c" x="80" y="144" text-anchor="middle">for { i++ }</text>
+  <rect class="bx-g" x="144" y="124" width="90" height="30" rx="6"/><text class="sm on-g" x="189" y="144" text-anchor="middle">其他 G / GC</text>
+  <rect class="bx-c" x="238" y="124" width="120" height="30" rx="6"/><text class="mono on-c" x="298" y="144" text-anchor="middle">for { i++ }</text>
+  <rect class="bx-g" x="362" y="124" width="90" height="30" rx="6"/><text class="sm on-g" x="407" y="144" text-anchor="middle">其他 G</text>
+  <rect class="bx-c" x="456" y="124" width="120" height="30" rx="6"/><text class="mono on-c" x="516" y="144" text-anchor="middle">for { i++ }</text>
+  <path class="ln-a" d="M142 118 V160 M360 118 V160"/>
+  <text class="sm on-a" x="142" y="176" text-anchor="middle">约 10ms 后发信号抢占</text>
+  <text class="sm on-a" x="360" y="176" text-anchor="middle">再次抢占</text>
+</svg>
+<figcaption>图 6-8　异步抢占让「霸占 CPU 的 goroutine」不再是问题</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="dev">把这一切呈现给开发者</h2>
+
+<p>
+  了解了 goroutine 在底层怎样工作，再退一步看开发者是怎样和这一切打交道的：<strong>就是 <code>go</code> 关键字。没了！</strong>
+  在函数或闭包前加个 <code>go</code>，就自动调度了一个任务，它会以最适合所在机器的方式高效运行。作为开发者，我们依然用熟悉的原语 —— 函数 —— 来思考，
+  不需要理解新的做事方式、复杂的数据结构或调度算法。
+</p>
+
+<div class="box key">
+  <div class="t">&#9733; 扩展性、效率与简单</div>
+  <p>这就是 goroutine 如此吸引人的原因。</p>
+</div>
+
+<div class="box modern">
+  <div class="t">&#127381; 新版 Go：亲眼看看调度器在做什么</div>
+  <ul>
+    <li><code>GODEBUG=schedtrace=1000 ./prog</code>：每秒打印一次调度器状态（每个 P 的本地队列长度、全局队列长度、线程数等）；加上 <code>scheddetail=1</code> 会更详细。</li>
+    <li><code>go tool trace</code>：用 <code>runtime/trace</code> 或 <code>go test -trace</code> 采集执行轨迹，在浏览器里看每个 P 上 goroutine 的运行、阻塞、被偷的时间线。<span class="ver">Go 1.22+</span> 采用了开销低得多的新追踪器；<span class="ver">Go 1.25+</span> 的 <code>trace.FlightRecorder</code> 可以在内存里持续保留最近一段轨迹，出问题时再导出（见附录 A）。</li>
+    <li><span class="ver">Go 1.25+</span> GOMAXPROCS（即 P 的数量）默认会根据容器的 CPU 配额自动设置和更新（第 3 章）。</li>
+  </ul>
+</div>
+
+<h2 id="conclusion">全书结语</h2>
+
+<p>
+  到这里，我们已经走遍了 Go 并发的全景：从第一性原理，到基本用法，到模式，再到运行时怎样做事。希望这本书让你对 Go 的并发有了扎实的把握，帮助你完成所有出色的项目。谢谢！
+</p>
+
+<div class="exercise">
+  <h3>&#9998; 动手练习</h3>
+  <ol>
+    <li>把两个分步演示各走一遍，用纸笔记下每一步「谁停顿了」，验证统计表中「停顿的汇合」的数字。</li>
+    <li>运行 <code>GODEBUG=schedtrace=1000</code> 和一个启动 10 万个 goroutine 做计算的程序，观察 <code>runqueue</code> 和各 P 队列长度的变化。</li>
+    <li>写一个只有 <code>for { i++ }</code> 的 goroutine，在主 goroutine 里 <code>runtime.GOMAXPROCS(1)</code> 后 <code>time.Sleep(time.Second)</code> 再打印。在 Go 1.14+ 上主 goroutine 能醒过来吗？想想为什么。</li>
+    <li>用 <code>go test -trace=trace.out</code> 跑第 4 章的扇出扇入例子，再用 <code>go tool trace trace.out</code> 查看各个 primeFinder 分布在哪些 P 上。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+<script>
+/* 第 6 章：工作窃取分步演示。数据按原书的推演逐步整理。
+   每一步：[说明, T1 调用栈, T1 deque, T2 调用栈, T2 deque]。
+   栈和 deque 都从上到下书写；deque 的第一个元素是「头」，最后一个是「尾」。
+   前缀 "~" 表示停在未实现的汇合点，"=" 表示返回值，"+" 表示延续，"!" 标记本步的变化。 */
+(() => {
+  const TASK = [
+    ['程序开始：只有主 goroutine，假设它被调度在 T1 上。', ['main'], [], [], []],
+    ['调用 fib(4)：新 goroutine 被放到 T1 deque 的尾部，父 goroutine（main）继续执行。', ['main'], ['!fib(4)'], [], []],
+    ['main 到达 &lt;-fib(4)，这个汇合点还没实现。T1 和 T2 都可能偷走 fib(4)，这里假设 T1 赢了。', ['~main（未实现的汇合点）', '!fib(4)'], [], [], []],
+    ['fib(4) 在 T1 上运行。加法从左到右求值，所以依次把 fib(3)、fib(2) 压入 T1 deque 尾部。', ['~main（未实现的汇合点）', 'fib(4)'], ['!fib(3)', '!fib(2)'], [], []],
+    ['T2 空闲，从 T1 deque 的<strong>头部</strong>偷走 fib(3)。注意 fib(2) —— fib(4) 最后压入、也是 T1 最可能马上需要的 —— 留在了 T1。', ['~main（未实现的汇合点）', 'fib(4)'], ['fib(2)'], ['!fib(3)'], []],
+    ['T1 上的 fib(4) 在等 fib(3)、fib(2) 的通道，到达未实现的汇合点（规则 3），于是从自己 deque 的<strong>尾部</strong>弹出 fib(2) 执行。', ['~main（未实现的汇合点）', '~fib(4)（未实现的汇合点）', '!fib(2)'], [], ['fib(3)'], []],
+    ['T2 上的 fib(3) 调度了两个新 goroutine：fib(2) 和 fib(1)（这个 fib(2) 是 3−1 产生的，和 T1 上那个 4−2 的不是同一个）。', ['~main（未实现的汇合点）', '~fib(4)（未实现的汇合点）', 'fib(2)'], [], ['fib(3)'], ['!fib(2)', '!fib(1)']],
+    ['T1 上的 fib(2) 到达递归的基本情况（n &lt;= 2），返回 1。', ['~main（未实现的汇合点）', '~fib(4)（未实现的汇合点）', '!=返回 1'], [], ['fib(3)'], ['fib(2)', 'fib(1)']],
+    ['T2 的 fib(3) 到达未实现的汇合点，从自己 deque 尾部弹出 fib(1)。', ['~main（未实现的汇合点）', '~fib(4)（未实现的汇合点）', '=返回 1'], [], ['~fib(3)（未实现的汇合点）', '!fib(1)'], ['fib(2)']],
+    ['T1 又空闲了，从 T2 deque 的头部偷走 fib(2)。', ['~main（未实现的汇合点）', '~fib(4)（未实现的汇合点）', '!fib(2)'], [], ['~fib(3)（未实现的汇合点）', 'fib(1)'], []],
+    ['T2 上的 fib(1) 到达基本情况，返回 1。', ['~main（未实现的汇合点）', '~fib(4)（未实现的汇合点）', 'fib(2)'], [], ['~fib(3)（未实现的汇合点）', '!=返回 1'], []],
+    ['T1 上的 fib(2) 也返回 1。', ['~main（未实现的汇合点）', '~fib(4)（未实现的汇合点）', '!=返回 1'], [], ['~fib(3)（未实现的汇合点）', '=返回 1'], []],
+    ['fib(3) 的两个汇合点（fib(2)、fib(1)）都实现了：计算 1+1=2，通过通道返回。', ['~main（未实现的汇合点）', '~fib(4)（未实现的汇合点）'], [], ['!=返回 2'], []],
+    ['fib(4) 的两个汇合点（fib(3)、fib(2)）也都实现了：计算 2+1=3，通过通道返回。', ['~main（未实现的汇合点）', '!=返回 3'], [], [], []],
+    ['主 goroutine 的汇合点 &lt;-fib(4) 实现了，打印结果 3。', ['!=main：打印 3'], [], [], []]
+  ];
+  const CONT = [
+    ['程序开始：主 goroutine 在 T1 上。', ['main'], [], [], []],
+    ['main 调用 fib(4)：T1 <strong>立即执行</strong> fib(4)，把 main 的延续压到自己 deque 的尾部。', ['!fib(4)'], ['!+cont. of main'], [], []],
+    ['T2 空闲，偷走 main 的延续。', ['fib(4)'], [], ['!+cont. of main'], []],
+    ['fib(4) 调度 fib(3) 并立即执行它，fib(4) 的延续被压到 T1 deque 尾部。', ['!fib(3)'], ['!+cont. of fib(4)'], ['+cont. of main'], []],
+    ['T2 执行 main 的延续时遇到未实现的汇合点（&lt;-fib(4)），于是从 T1 偷走 fib(4) 的延续。', ['fib(3)'], [], ['~cont. of main（未实现的汇合点）', '!+cont. of fib(4)'], []],
+    ['T1 上的 fib(3) 调度 fib(2) 并立即执行，fib(3) 的延续压入 T1 deque 尾部。', ['!fib(2)'], ['!+cont. of fib(3)'], ['~cont. of main（未实现的汇合点）', '+cont. of fib(4)'], []],
+    ['T2 执行 fib(4) 的延续，接着 T1 留下的地方：调度 fib(2) 并立即执行，fib(4) 的延续又被压回 T2 deque。', ['fib(2)'], ['+cont. of fib(3)'], ['~cont. of main（未实现的汇合点）', '!fib(2)'], ['!+cont. of fib(4)']],
+    ['T1 上的 fib(2) 到达基本情况，返回 1。', ['!=返回 1'], ['+cont. of fib(3)'], ['~cont. of main（未实现的汇合点）', 'fib(2)'], ['+cont. of fib(4)']],
+    ['T2 上的 fib(2) 也到达基本情况，返回 1。', ['=返回 1'], ['+cont. of fib(3)'], ['~cont. of main（未实现的汇合点）', '!=返回 1'], ['+cont. of fib(4)']],
+    ['T1 从<strong>自己</strong>的队列取回 fib(3) 的延续，执行 fib(1)。注意 T1 上的调用链是 fib(3) → fib(2) → fib(1)，这正是延续窃取的好处。', ['!fib(1)'], [], ['~cont. of main（未实现的汇合点）', '=返回 1'], ['+cont. of fib(4)']],
+    ['T2 执行到 fib(4) 延续的末尾，但只实现了一个汇合点（fib(2)），fib(3) 还在 T1 上算。没有可偷的工作，T2 空闲等待。', ['fib(1)'], [], ['~cont. of main（未实现的汇合点）', '!~fib(4)（未实现的汇合点）'], []],
+    ['T1 的 fib(3) 两个汇合点都实现了，返回 2，交给 T2 上等待的 fib(4)。', ['!=返回 2'], [], ['~cont. of main（未实现的汇合点）', '~fib(4)：收到 2'], []],
+    ['fib(4) 的两个汇合点都实现了，T2 计算 2+1=3 并返回。', [], [], ['~cont. of main（未实现的汇合点）', '!=返回 3'], []],
+    ['主 goroutine 的汇合点实现了，在 T2 上打印 3。', [], [], ['!=main：打印 3'], []]
+  ];
+
+  const chip = (s) => {
+    let cls = 'chip';
+    if (s.startsWith('!')) { cls += ' new'; s = s.slice(1); }
+    if (s.startsWith('~')) { cls += ' wait'; s = s.slice(1); }
+    else if (s.startsWith('=')) { cls += ' ret'; s = s.slice(1); }
+    else if (s.startsWith('+')) { cls += ' cont'; s = s.slice(1); }
+    return `<div class="${cls}">${s}</div>`;
+  };
+  const col = (title, cls, items, deque) =>
+    `<div class="col ${cls}"><div class="h">${title}</div>${items.map(chip).join('')}` +
+    (deque ? '<div class="ends"><span>↑ 头</span><span>尾 ↓</span></div>' : '') + '</div>';
+
+  function setup(id, steps) {
+    const root = document.getElementById(id);
+    if (!root) return;
+    let i = 0;
+    const desc = root.querySelector('.desc');
+    const board = root.querySelector('.board');
+    const count = root.querySelector('.count');
+    const [prev, next] = [root.querySelector('[data-act=prev]'), root.querySelector('[data-act=next]')];
+    const render = () => {
+      const [d, s1, q1, s2, q2] = steps[i];
+      desc.innerHTML = d;
+      board.innerHTML =
+        col('T1 调用栈', 't1', s1, false) + col('T1 deque', 't1', q1, true) +
+        col('T2 调用栈', 't2', s2, false) + col('T2 deque', 't2', q2, true);
+      count.textContent = `${i + 1} / ${steps.length}`;
+      prev.disabled = i === 0;
+      next.disabled = i === steps.length - 1;
+    };
+    root.addEventListener('click', (e) => {
+      const act = e.target.closest('button')?.dataset.act;
+      if (act === 'prev' && i > 0) i--;
+      else if (act === 'next' && i < steps.length - 1) i++;
+      else if (act === 'reset') i = 0;
+      else return;
+      render();
+    });
+    render();
+  }
+  setup('task-stepper', TASK);
+  setup('cont-stepper', CONT);
+})();
+</script>
+</body>
+</html>

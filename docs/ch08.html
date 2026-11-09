@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>附录 B · 从 Go 1.8 到今天 — Go 并发编程图解笔记</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="8">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">附录 B</span>
+<h1>从 Go 1.8 到今天</h1>
+<p class="lede">
+  《Concurrency in Go》出版于 2017 年，对应 Go 1.8。书中的思想 —— 约束、通道所有权、done 通道、管道、错误即结果、心跳、限流 —— 至今依然是 Go 并发编程的基石；
+  变化的主要是<strong>写法</strong>和<strong>工具</strong>。这一页把散落在各章的「新版 Go」注释汇总起来，并给出一份老代码现代化清单。
+</p>
+
+<div id="chapter-toc"></div>
+
+<h2 id="versions">版本速查表</h2>
+
+<p>只列出与并发相关、或在本书代码中会遇到的变化（本笔记写作时的最新版本为 Go 1.27）：</p>
+
+<div class="tw">
+<table>
+  <tr><th>版本</th><th>变化</th><th>在本笔记中</th></tr>
+  <tr><td><span class="ver old">1.8</span></td><td>本书所用版本；GC 停顿已降到 10–100μs；<code>sort.Slice</code> 加入</td><td>—</td></tr>
+  <tr><td><span class="ver">1.9</span></td><td><code>sync.Map</code>；<code>sync.Mutex</code> 加入饥饿模式（等待超过 1ms 的等待者优先）</td><td><a href="ch01.html#starvation">第 1 章</a>、<a href="ch03.html#mutex">第 3 章</a></td></tr>
+  <tr><td><span class="ver">1.13</span></td><td>错误包装：<code>%w</code>、<code>errors.Is/As/Unwrap</code>；<code>sync.Pool</code> 受害者缓存</td><td><a href="ch05.html#errors">第 5 章</a>、<a href="ch03.html#pool">第 3 章</a></td></tr>
+  <tr><td><span class="ver">1.14</span></td><td><strong>基于信号的异步抢占</strong>；<code>defer</code> 几乎零开销</td><td><a href="ch06.html#preempt">第 6 章</a>、<a href="ch03.html#mutex">第 3 章</a></td></tr>
+  <tr><td><span class="ver">1.16</span></td><td><code>io/ioutil</code> 弃用；<code>runtime/metrics</code></td><td><a href="ch07.html#pprof">附录 A</a></td></tr>
+  <tr><td><span class="ver">1.18</span></td><td><strong>泛型</strong>；<code>any</code>；<code>Mutex.TryLock</code></td><td><a href="ch04.html#generators">第 4 章</a></td></tr>
+  <tr><td><span class="ver">1.19</span></td><td><code>atomic.Int64/Bool/Pointer[T]</code> 等类型；正式修订的内存模型；<code>GOMEMLIMIT</code></td><td><a href="ch01.html#atomic">第 1 章</a></td></tr>
+  <tr><td><span class="ver">1.20</span></td><td><code>context.WithCancelCause</code>/<code>Cause</code>；<code>errors.Join</code>；<code>math/rand</code> 自动随机播种</td><td><a href="ch04.html#context">第 4 章</a></td></tr>
+  <tr><td><span class="ver">1.21</span></td><td><code>sync.OnceFunc/OnceValue/OnceValues</code>；<code>context.AfterFunc/WithoutCancel/WithTimeoutCause</code>；<code>log/slog</code>；<code>min/max/clear</code>；栈跟踪显示父 goroutine</td><td><a href="ch03.html#once">第 3 章</a>、<a href="ch04.html#context">第 4 章</a></td></tr>
+  <tr><td><span class="ver">1.22</span></td><td><strong>循环变量每轮迭代独立</strong>；<code>for i := range n</code>；<code>math/rand/v2</code>；低开销执行追踪器</td><td><a href="ch03.html#closure">第 3 章</a></td></tr>
+  <tr><td><span class="ver">1.23</span></td><td>迭代器（range-over-func、<code>iter</code> 包）；未停止的 Timer/Ticker 可被回收、定时器通道变为同步</td><td><a href="ch03.html#select-timeout">第 3 章</a>、<a href="ch04.html#generators">第 4 章</a></td></tr>
+  <tr><td><span class="ver">1.24</span></td><td><code>testing.T.Context()</code>、<code>B.Loop()</code>；<code>sync.Map</code> 新实现；<code>synctest</code> 实验</td><td><a href="ch04.html#context">第 4 章</a></td></tr>
+  <tr><td><span class="ver">1.25</span></td><td><strong><code>WaitGroup.Go</code></strong>；<strong><code>testing/synctest</code> 正式发布</strong>；GOMAXPROCS 感知容器配额；<code>trace.FlightRecorder</code>；vet 的 <code>waitgroup</code> 检查</td><td><a href="ch03.html#waitgroup">第 3 章</a>、<a href="ch05.html#heartbeats">第 5 章</a></td></tr>
+  <tr><td><span class="ver">1.26</span></td><td>Green Tea GC 默认启用；<code>errors.AsType</code>；<code>goroutineleak</code> 剖析（实验）；<code>go fix</code> 重写为「现代化」工具</td><td><a href="ch07.html#leak">附录 A</a></td></tr>
+  <tr><td><span class="ver">1.27</span></td><td><code>goroutineleak</code> 剖析默认可用；栈跟踪默认显示 goroutine 标签；移除 <code>asynctimerchan</code> 开关</td><td><a href="ch07.html#leak">附录 A</a></td></tr>
+</table>
+</div>
+
+<h2 id="unchanged">没有变的东西</h2>
+
+<p>先强调一下：书里最重要的内容一点都没过时。</p>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#128273;</span><h4>谁启动，谁负责停止</h4><p>每个 goroutine 都要有退出路径。今天用 <code>context</code> 表达，原理和 done 通道完全相同。</p></div>
+  <div class="card"><span class="ic">&#127968;</span><h4>通道所有权</h4><p>创建、写入、关闭由同一个所有者负责，对外只暴露 <code>&lt;-chan</code>。</p></div>
+  <div class="card"><span class="ic">&#128230;</span><h4>错误随结果一起返回</h4><p>不要让 goroutine 自己打印错误了事。今天常用 errgroup 或泛型 Result。</p></div>
+  <div class="card"><span class="ic">&#128207;</span><h4>队列不提速</h4><p>利特尔法则依然成立：队列是用延迟换稳定，只放在入口或批处理处。</p></div>
+  <div class="card"><span class="ic">&#129504;</span><h4>锁还是通道</h4><p>第 2 章的决策树依然适用：保护内部状态用锁，转移所有权和协调用通道。</p></div>
+  <div class="card"><span class="ic">&#128147;</span><h4>心跳与限流</h4><p>生产环境的健康检查和令牌桶限流，思路完全不变。</p></div>
+</div>
+
+<h2 id="checklist">老代码现代化清单</h2>
+
+<p>下面每一条左边是书中（Go 1.8 时代）的写法，右边是今天推荐的写法。很多条目可以用 <code>go fix</code> 自动完成（见本页末尾）。</p>
+
+<h3 id="m-any">1. <code>interface{}</code> → <code>any</code> 或泛型 <span class="ver">1.18</span></h3>
+<div class="vs">
+  <div class="old"><div class="h">书中写法</div>
+<div class="code" data-lang="go"><pre>
+take := func(
+	done &lt;-chan interface{},
+	valueStream &lt;-chan interface{},
+	num int,
+) &lt;-chan interface{} { ... }
+
+toInt := func(...) &lt;-chan int // 再写一个类型断言阶段
+</pre></div></div>
+  <div class="new"><div class="h">新写法</div>
+<div class="code" data-lang="go"><pre>
+func Take[T any](
+	ctx context.Context,
+	in &lt;-chan T,
+	n int,
+) &lt;-chan T { ... }
+
+// 不再需要 toInt / toString 阶段
+</pre></div></div>
+</div>
+
+<h3 id="m-ctx">2. 自制 done 通道 → <code>context.Context</code> <span class="ver">1.7</span></h3>
+<div class="vs">
+  <div class="old"><div class="h">书中写法</div>
+<div class="code" data-lang="go"><pre>
+done := make(chan interface{})
+defer close(done)
+for v := range stage(done, in) { ... }
+
+// stage 内部
+select {
+case &lt;-done:
+	return
+case out &lt;- v:
+}
+</pre></div></div>
+  <div class="new"><div class="h">新写法</div>
+<div class="code" data-lang="go"><pre>
+ctx, cancel := context.WithCancel(ctx)
+defer cancel()
+for v := range stage(ctx, in) { ... }
+
+// stage 内部
+select {
+case &lt;-ctx.Done():
+	return
+case out &lt;- v:
+}
+</pre></div></div>
+</div>
+<p>自己的纯信号通道，用 <code>chan struct{}</code> 而不是 <code>chan interface{}</code>。</p>
+
+<h3 id="m-loopvar">3. 循环变量的副本 → 不再需要 <span class="ver">1.22</span></h3>
+<div class="vs">
+  <div class="old"><div class="h">书中写法</div>
+<div class="code" data-lang="go"><pre>
+for _, s := range list {
+	go func(s string) {
+		fmt.Println(s)
+	}(s)
+}
+// 或者：s := s
+</pre></div></div>
+  <div class="new"><div class="h">新写法（go.mod ≥ 1.22）</div>
+<div class="code" data-lang="go"><pre>
+for _, s := range list {
+	go func() {
+		fmt.Println(s) // 每轮迭代独立的 s
+	}()
+}
+</pre></div></div>
+</div>
+
+<h3 id="m-wggo">4. <code>wg.Add(1)</code> + <code>defer wg.Done()</code> → <code>wg.Go</code> <span class="ver">1.25</span></h3>
+<div class="vs">
+  <div class="old"><div class="h">书中写法</div>
+<div class="code" data-lang="go"><pre>
+var wg sync.WaitGroup
+for i := 0; i &lt; n; i++ {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		work()
+	}()
+}
+wg.Wait()
+</pre></div></div>
+  <div class="new"><div class="h">新写法</div>
+<div class="code" data-lang="go"><pre>
+var wg sync.WaitGroup
+for range n {
+	wg.Go(work)
+}
+wg.Wait()
+</pre></div></div>
+</div>
+
+<h3 id="m-errgroup">5. goroutine + 错误收集 + 取消 → <code>errgroup</code></h3>
+<div class="vs">
+  <div class="old"><div class="h">书中写法（第 4 章 Result 模式）</div>
+<div class="code" data-lang="go"><pre>
+type Result struct {
+	Error    error
+	Response *http.Response
+}
+// 每个 goroutine 往 results 通道发 Result，
+// 主 goroutine 统计错误、决定是否 close(done)
+</pre></div></div>
+  <div class="new"><div class="h">新写法（golang.org/x/sync/errgroup）</div>
+<div class="code" data-lang="go"><pre>
+g, ctx := errgroup.WithContext(ctx)
+g.SetLimit(10) // 可选：限制并发数
+for _, url := range urls {
+	g.Go(func() error { return fetch(ctx, url) })
+}
+err := g.Wait() // 第一个错误；出错时 ctx 被取消
+</pre></div></div>
+</div>
+<p>需要逐个处理每个结果（而不是「第一个错误就全部取消」）时，书中的 Result 通道模式依然是好选择。</p>
+
+<h3 id="m-once">6. <code>sync.Once</code> + 变量 → <code>OnceValue</code> <span class="ver">1.21</span></h3>
+<div class="vs">
+  <div class="old"><div class="h">旧写法</div>
+<div class="code" data-lang="go"><pre>
+var (
+	once sync.Once
+	cfg  *Config
+)
+func getConfig() *Config {
+	once.Do(func() { cfg = load() })
+	return cfg
+}
+</pre></div></div>
+  <div class="new"><div class="h">新写法</div>
+<div class="code" data-lang="go"><pre>
+var getConfig = sync.OnceValue(load)
+</pre></div></div>
+</div>
+
+<h3 id="m-atomic">7. <code>atomic.AddInt64(&amp;x, 1)</code> → <code>atomic.Int64</code> <span class="ver">1.19</span></h3>
+<div class="vs">
+  <div class="old"><div class="h">书中写法</div>
+<div class="code" data-lang="go"><pre>
+var left int32
+atomic.AddInt32(&amp;left, 1)
+if atomic.LoadInt32(&amp;left) == 1 { ... }
+</pre></div></div>
+  <div class="new"><div class="h">新写法</div>
+<div class="code" data-lang="go"><pre>
+var left atomic.Int32
+left.Add(1)
+if left.Load() == 1 { ... }
+</pre></div></div>
+</div>
+
+<h3 id="m-errors">8. <code>pkg/errors</code> 与类型断言 → 标准库错误包装 <span class="ver">1.13</span><span class="ver">1.26</span></h3>
+<div class="vs">
+  <div class="old"><div class="h">书中写法</div>
+<div class="code" data-lang="go"><pre>
+if _, ok := err.(IntermediateErr); ok {
+	msg = err.Error()
+}
+</pre></div></div>
+  <div class="new"><div class="h">新写法</div>
+<div class="code" data-lang="go"><pre>
+// 包装：fmt.Errorf("cannot run job %q: %w", id, err)
+if e, ok := errors.AsType[IntermediateErr](err); ok {
+	msg = e.Error()
+}
+// Go 1.26 之前：var e IntermediateErr; errors.As(err, &amp;e)
+</pre></div></div>
+</div>
+
+<h3 id="m-std">9. 其他标准库替换</h3>
+<div class="tw">
+<table>
+  <tr><th>书中写法</th><th>新写法</th><th>版本</th></tr>
+  <tr><td><code>ioutil.ReadAll</code></td><td><code>io.ReadAll</code></td><td>1.16</td></tr>
+  <tr><td><code>ioutil.TempFile</code></td><td><code>os.CreateTemp</code></td><td>1.16</td></tr>
+  <tr><td><code>rand.Intn</code>（需要手动 Seed）</td><td><code>math/rand/v2</code> 的 <code>rand.IntN</code>（自动播种、并发安全）</td><td>1.22</td></tr>
+  <tr><td><code>sort.Slice(s, less)</code></td><td><code>slices.SortFunc(s, cmp)</code></td><td>1.21</td></tr>
+  <tr><td><code>for i := 0; i &lt; n; i++</code></td><td><code>for i := range n</code></td><td>1.22</td></tr>
+  <tr><td><code>runtime.GOMAXPROCS(runtime.NumCPU())</code> / <code>automaxprocs</code></td><td>删掉，默认值已经正确（含容器配额）</td><td>1.5 / 1.25</td></tr>
+  <tr><td><code>log.Printf</code> + 手工拼日志 ID</td><td><code>slog.Error("msg", "logID", id, "err", err)</code></td><td>1.21</td></tr>
+  <tr><td><code>time.Tick</code> 在 goroutine 里会泄漏</td><td>已不再泄漏；需要停止时用 <code>NewTicker</code> + <code>Stop</code></td><td>1.23</td></tr>
+</table>
+</div>
+
+<h3 id="m-tests">10. 靠超时的并发测试 → <code>synctest</code> <span class="ver">1.25</span></h3>
+<div class="vs">
+  <div class="old"><div class="h">书中写法</div>
+<div class="code" data-lang="go"><pre>
+heartbeat, results := DoWork(done, nums...)
+&lt;-heartbeat // 等心跳，避免不确定的超时
+for r := range results { ... }
+</pre></div></div>
+  <div class="new"><div class="h">新写法</div>
+<div class="code" data-lang="go"><pre>
+synctest.Test(t, func(t *testing.T) {
+	// 假时钟：Sleep、超时、Ticker 都瞬间且确定
+	_, results := DoWork(done, nums...)
+	for r := range results { ... }
+})
+</pre></div></div>
+</div>
+
+<h3 id="m-iter">11. 不需要并发的生成器 → 迭代器 <span class="ver">1.23</span></h3>
+<div class="vs">
+  <div class="old"><div class="h">通道生成器（有 goroutine，要考虑泄漏）</div>
+<div class="code" data-lang="go"><pre>
+func Count(done &lt;-chan struct{}, n int) &lt;-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for i := range n {
+			select {
+			case &lt;-done:
+				return
+			case out &lt;- i:
+			}
+		}
+	}()
+	return out
+}
+</pre></div></div>
+  <div class="new"><div class="h">迭代器（没有 goroutine）</div>
+<div class="code" data-lang="go"><pre>
+func Count(n int) iter.Seq[int] {
+	return func(yield func(int) bool) {
+		for i := range n {
+			if !yield(i) { // 调用方 break 时返回 false
+				return
+			}
+		}
+	}
+}
+
+for i := range Count(10) { ... }
+</pre></div></div>
+</div>
+<p>经验法则：<strong>阶段之间需要真正并发执行时用通道；只是想「一个一个地产出值」时用迭代器。</strong></p>
+
+<h2 id="gofix">让工具帮你改：<code>go fix</code> <span class="ver">1.26+</span></h2>
+
+<p>
+  Go 1.26 把 <code>go fix</code> 重写成了基于分析框架的「现代化」工具，内置了一组修复器，其中好几个正好对应本书的老写法。
+  下面是本笔记用 Go 1.27 对一段「书中风格」代码运行 <code>go fix -diff</code> 的真实结果：
+</p>
+
+<div class="code" data-lang="text" data-file="go fix -diff ./...（Go 1.27）">
+<pre>
+ func main() {
+-	var n int64
++	var n atomic.Int64
+ 	var wg sync.WaitGroup
+-	for i := 0; i &lt; 3; i++ {
++	for i := range 3 {
+ 		i := i
+-		wg.Add(1)
+-		go func() {
+-			defer wg.Done()
+-			atomic.AddInt64(&amp;n, int64(i))
+-		}()
++		wg.Go(func() {
++			n.Add(int64(i))
++		})
+ 	}
+ 	wg.Wait()
+-	var x interface{} = atomic.LoadInt64(&amp;n)
++	var x any = n.Load()
+ 	fmt.Println(x)
+ }
+</pre>
+</div>
+
+<p>（应用后再运行一次，<code>forvar</code> 修复器会接着删掉多余的 <code>i := i</code>；所以可以反复运行直到 <code>go fix -diff</code> 不再输出。）与并发相关的修复器：</p>
+
+<div class="tw">
+<table>
+  <tr><th>修复器</th><th>作用</th></tr>
+  <tr><td><code>waitgroupgo</code></td><td><code>wg.Add(1)</code> + <code>go</code> + <code>wg.Done()</code> → <code>wg.Go</code></td></tr>
+  <tr><td><code>atomictypes</code></td><td><code>sync/atomic</code> 函数调用 → 原子类型</td></tr>
+  <tr><td><code>forvar</code></td><td>删除多余的 <code>x := x</code> 循环变量副本</td></tr>
+  <tr><td><code>rangeint</code></td><td>三段式 for 循环 → <code>for i := range n</code></td></tr>
+  <tr><td><code>any</code></td><td><code>interface{}</code> → <code>any</code></td></tr>
+  <tr><td><code>errorsastype</code></td><td><code>errors.As</code> → <code>errors.AsType[T]</code></td></tr>
+  <tr><td><code>testingcontext</code></td><td>测试里的 <code>context.WithCancel</code> → <code>t.Context()</code></td></tr>
+  <tr><td><code>slicessort</code></td><td>基本类型的 <code>sort.Slice</code> → <code>slices.Sort</code></td></tr>
+</table>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; 升级 go.mod 版本前先跑测试</div>
+  <p>
+    把 <code>go.mod</code> 里的 <code>go</code> 版本从 1.21 以下升到 1.22+，会改变循环变量的语义；升到 1.23+ 会改变定时器行为；升到 1.25+ 会改变 GOMAXPROCS 默认值。
+    这些变化几乎总是修好 bug 而不是引入 bug，但为了保险：先在旧版本下跑一遍 <code>go test -race ./...</code>，升级后再跑一遍。
+  </p>
+</div>
+
+<h2 id="further">继续学习</h2>
+<ul>
+  <li><a href="https://go.dev/ref/mem">The Go Memory Model</a>：理解「happens before」，第 1 章的进阶读物。</li>
+  <li><a href="https://go.dev/blog/pipelines">Go Concurrency Patterns: Pipelines and cancellation</a>：第 4 章管道模式的官方博客版本。</li>
+  <li><a href="https://go.dev/blog/context">Go Concurrency Patterns: Context</a>：context 包的设计初衷。</li>
+  <li><a href="https://go.dev/blog/synctest">Testing concurrent code with testing/synctest</a>：第 5 章、附录 A 的 synctest。</li>
+  <li><a href="https://go.dev/doc/articles/race_detector">Data Race Detector</a>：竞态检测器的完整文档。</li>
+  <li>各版本发布说明：<a href="https://go.dev/doc/devel/release">go.dev/doc/devel/release</a>。</li>
+</ul>
+
+<div id="pager"></div>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>
